@@ -1,0 +1,4 @@
+pyzmq
+pymongo
+click
+-e git+https://github.com/mortbauer/dictdiffer.git#egg=dictdiffer
