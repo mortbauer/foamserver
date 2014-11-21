@@ -17,8 +17,6 @@ from .utils import PyFoamDictEncoder,SystemEventHandler, DatEventHandler, LogEve
 
 
 class Harvester(object):
-    HOST = 'localhost'
-    PORT = 5051
     REQUEST_TIMEOUT = 2500
     SLEEP_TIME = 2
     PERSISTENCE = '.harvester.json'
@@ -33,7 +31,9 @@ class Harvester(object):
         self.load_conf()
         self.context = zmq.Context()
         self.hostname = socket.gethostname()
-        self.server_addr = 'tcp://{0}:{1}'.format(self.HOST,self.PORT)
+        self.server_addr = 'tcp://{0}:{1}'.format(
+            self.conf.get('host','localhost'),
+            self.conf.get('port',5051))
         self.data = {} if data is None else data
         if logging:
             self.add_logger()
