@@ -74,8 +74,8 @@ class Harvester(object):
             self.data['system'] = {}
         observer.schedule(
             SystemEventHandler(
-                self.msgs,'system',self.data['system']),
-            'system',recursive=False,logger=self._logger)
+                self.msgs,'system',self.data['system'],logger=self._logger),
+            'system',recursive=False)
         #observer.schedule(
             #SystemEventHandler(
                 #self.msgs,'0.00000000e+00',self.data['system']),
@@ -84,7 +84,7 @@ class Harvester(object):
             self.data['postProcessing'] = {}
         observer.schedule(
             DatEventHandler(
-                self.msgs,'postProcessing',self.data['postProcessing']),
+                self.msgs,'postProcessing',self.data['postProcessing'],logger=self._logger),
             'postProcessing',recursive=True)
         if not 'logs' in self.data:
             self.data['logs'] = {}
