@@ -64,8 +64,8 @@ class Harvester(object):
         except:
             self.log('error','failed to load {0}'.format(self.PERSISTENCE))
         finally:
-            if not 'harvester_startime' in self.data:
-                self.data['harvester_startime'] = datetime.datetime.utcnow()
+            if not 'harvester_starttime' in self.data:
+                self.data['harvester_starttime'] = datetime.datetime.utcnow()
             self.msgs = self.data['msgs']
 
     def create_observer(self):
@@ -110,7 +110,7 @@ class Harvester(object):
         msg = json.dumps({
             'project':self.project,
             'host':self.hostname,
-            'harvester_startime':self.data['harvester_startime'],
+            'harvester_starttime':self.data['harvester_starttime'],
             'data':self.msgs[:n],
         },cls=PyFoamDictEncoder)
         try:

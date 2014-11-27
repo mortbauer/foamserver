@@ -28,7 +28,7 @@ class PyFoamDictEncoder(json.JSONEncoder):
         elif isinstance(obj,DataStructures.Dimension):
             return json.JSONEncoder.encode(self, obj.dims)
         elif isinstance(obj,datetime.datetime):
-            return obj.strftime("%Y-%m-%d %H:%M:%S %m")
+            return obj.strftime("%Y-%m-%dT%H:%M:%S")
         else:
             return json.JSONEncoder.default(self, obj)
 
@@ -90,7 +90,7 @@ class LogEventHandler(RegexMatchingEventHandler):
     def __init__(self,queue,path='./',data=None):
         super(LogEventHandler,self).__init__(
             regexes=[os.path.join(path,x) for x in [
-                'log\.[a-zA-Z]+$','slurm-[a-zA-Z]+','FOAM\.o[0-9]+']])
+                'log\.[a-zA-Z.0-9]+$','slurm-[a-zA-Z0-9]+\.out','FOAM\.o[0-9]+']])
         self.data = {} if data is None else data
         self.queue = queue
         for rel_path in os.listdir(path):
@@ -116,7 +116,7 @@ class LogEventHandler(RegexMatchingEventHandler):
                     {'path':fpath,
                      'type':'log',
                      'is_new':is_new,
-                     'ctime':stat.st_ctime,
+                     'ctime':datetime.datetime.fromtimestamp(stat.st_ctime),
                      'timestamp':datetime.datetime.utcnow(),
                      'loglines':data})
             d['last_pos'] = f.tell()
@@ -127,50 +127,57 @@ class LogEventHandler(RegexMatchingEventHandler):
 
 class DatEventHandler(RegexMatchingEventHandler):
 
-    def __init__(self,queue,path,data=None):
+    def __init__(self,queue,path,data=None,logger=None):
         super(DatEventHandler,self).__init__(
             ignore_directories=True,regexes=['.*.dat'])
+        self._logger = logger
         self.data = {} if data is None else data
         self.queue = queue
         for fpath in glob.glob(os.path.join(path,'**/**/*.dat')):
             self.update_data(fpath)
 
+    def log(self,level,msg):
+        if self._logger is not None:
+            getattr(self._logger,level)(msg)
+
     def update_data(self,fpath):
         stat = os.stat(fpath)
         is_new = False
         if fpath not in self.data or stat.st_size < self.data[fpath]['last_pos']:
-            d = self.data[fpath] = {'line':0,'last_pos':0}
+            d = self.data[fpath] = {'line':0,'last_pos':0,'meta':{}}
             is_new = True
         elif stat.st_size > self.data[fpath]['last_pos']:
             d = self.data[fpath]
+            if 'head' in d['meta']:
+                data = {x:[] for x in d['meta']['head']}
         else:
             return False
-        if 'head' in d:
-            data = {x:[] for x in d['head']}
         with open(fpath,'r') as f:
             f.seek(d['last_pos'])
             for line in f:
                 if line.lstrip().startswith('#'):
-                    d['head'] = line.split()[1:]
-                    data = {x:[] for x in d['head']}
+                    if ':' in line:
+                        label,val = line.lstrip()[1:].split(':')
+                        d['meta'][label.strip()] = val.strip()
+                    else:
+                        d['meta']['head'] = line.split()[1:]
+                        data = {x:[] for x in d['meta']['head']}
                 else:
                     try:
                         dline = [float(x) for x in line.split()]
+                        for i,col in enumerate(d['meta']['head']):
+                            data[col].append(dline[i])
                     except ValueError:
-                        dline = line.split()
-                    try:
-                        for i,x in enumerate(dline):
-                            data[d['head'][i]].append(x)
-                    except IndexError:
-                        raise IndexError('for path: {0}'.format(fpath))
+                        self.log('error','failed to get dat: {0}'.format(line))
                 d['line'] += 1
             d['last_pos'] = f.tell()
         self.queue.append(
             {'path':fpath,
              'type':'dat',
              'is_new':is_new,
-             'ctime':stat.st_ctime,
+             'ctime':datetime.datetime.fromtimestamp(stat.st_ctime),
              'timestamp':datetime.datetime.utcnow(),
+             'meta':d['meta'],
              'data':data})
         return True
 

@@ -108,13 +108,16 @@ class FoamServer(object):
     def process_msg(self,msg):
         payload = json.loads(msg)
         project = payload['project']
-        harvester_startime = payload['harvester_startime']
+        host = payload['host']
+        harvester_starttime = payload['harvester_starttime']
         data = payload['data']
         for d in data:
             base_doc = {
                 'project':project,
                 'path':d['path'],
-                'harvester_startime':harvester_startime,
+                'type':d['type'],
+                'host':host,
+                'harvester_starttime':harvester_starttime,
             }
             if 'ctime' in d:
                 base_doc['ctime'] = d['ctime']
@@ -122,12 +125,19 @@ class FoamServer(object):
             if doc is None:
                 doc = base_doc
                 if d['type'] == 'log':
-                    doc['loglines'] = {d['timestamp']:d['loglines']}
+                    doc['data'] = {'loglines':{d['timestamp']:d['loglines']}}
                 elif d['type'] == 'dat':
-                    doc['data'] = d['data']
+                    path_pieces = d['path'].split('/')
+                    doc['data'] = {
+                        'data':d['data'],
+                        'time':d['data'].pop('Time'),
+                        'meta':d['meta'],
+                        'starttime':float(path_pieces[-2]),
+                        'name':path_pieces[-3],
+                        'file':path_pieces[-1],
+                    }
                 elif d['type'] == 'system':
-                    doc['doc'] = d['doc']
-                    doc['diffs'] = {}
+                    doc['data'] = {'doc':d['doc'],'diffs':{}}
                 else:
                     self.log('error','type {0} unknown for: {1}'.format(d['type'],base_doc))
                 self.db[d['type']].insert(doc)
@@ -139,16 +149,16 @@ class FoamServer(object):
                     self.db[d['type']].update(
                         {'_id':doc['_id']},
                         {'$set':{
-                            'loglines.{0}'.format(d['timestamp']):d['loglines']}}
+                            'data.loglines.{0}'.format(d['timestamp']):d['loglines']}}
                     )
                 elif d['type'] == 'system':
                     if 'doc' in d:
-                        diffs = list(self.differ.diff(doc['doc'],d['doc']))
+                        diffs = list(self.differ.diff(doc['data']['doc'],d['doc']))
                     else:
                         diffs = d['diffs']
                     self.db[d['type']].update(
                         {'_id':doc['_id']},
-                        {'$set':{'diffs.{0}'.format(d['timestamp']):diffs}}
+                        {'$set':{'data.diffs.{0}'.format(d['timestamp']):diffs}}
                     )
                 elif d['type'] == 'dat':
                     self.db[d['type']].update(
