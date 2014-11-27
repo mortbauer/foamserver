@@ -56,12 +56,13 @@ class SystemEventHandler(RegexMatchingEventHandler):
             text = f.read()
             hasher.update(text)
             try:
-                parser = FoamStringParser(text,write_tables=False)
+                parser = FoamStringParser(text)
             except Exception as e:
                 self.log('error','FoamStringParser failed because of: {0}'.format(e))
                 try:
-                    parser = FoamFileParser(text,write_tables=False)
+                    parser = FoamFileParser(text)
                 except Exception as e:
+                    self.log('error','FoamFileParser failed because of: {0}'.format(e))
                     raise Exception('unparseable file, {0}'.format(fpath))
             if parser.header is not None:
                 d['header'] = parser.header
