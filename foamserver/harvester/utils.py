@@ -35,11 +35,12 @@ class PyFoamDictEncoder(json.JSONEncoder):
 class SystemEventHandler(RegexMatchingEventHandler):
     ignore_directories = True
 
-    def __init__(self,queue,path='system',data=None):
+    def __init__(self,queue,path='system',data=None,logger=None):
         super(SystemEventHandler,self).__init__(
             regexes=[os.path.join(path,'[a-z_\-A-Z]+')],
             ignore_directories=True
         )
+        self._logger = logger
         self.data = {} if data is None else data
         self.differ = PyFoamDictDiffer()
         self.queue = queue
@@ -57,6 +58,7 @@ class SystemEventHandler(RegexMatchingEventHandler):
             try:
                 parser = FoamStringParser(text,write_tables=False)
             except Exception as e:
+                self.log('error','FoamStringParser failed because of: {0}'.format(e))
                 try:
                     parser = FoamFileParser(text,write_tables=False)
                 except Exception as e:
@@ -81,6 +83,10 @@ class SystemEventHandler(RegexMatchingEventHandler):
         # update my data
         self.data[fpath] = d
         return True
+
+    def log(self,level,msg):
+        if self._logger is not None:
+            getattr(self._logger,level)(msg)
 
     def on_modified(self,event):
         self.get_data(event.src_path)

@@ -75,7 +75,7 @@ class Harvester(object):
         observer.schedule(
             SystemEventHandler(
                 self.msgs,'system',self.data['system']),
-            'system',recursive=False)
+            'system',recursive=False,logger=self._logger)
         #observer.schedule(
             #SystemEventHandler(
                 #self.msgs,'0.00000000e+00',self.data['system']),
