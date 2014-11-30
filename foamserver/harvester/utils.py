@@ -20,9 +20,11 @@ class SystemEventHandler(RegexMatchingEventHandler):
         self.queue = queue
         for rel_path in os.listdir(path):
             fpath = os.path.join(path,rel_path)
-            self.get_data(fpath)
+            if os.path.isfile(fpath):
+                self.get_data(fpath)
 
     def get_data(self,fpath):
+        self.log('critical','just started processing')
         doc = {
             'path':fpath,
             'type':'system',
@@ -30,18 +32,21 @@ class SystemEventHandler(RegexMatchingEventHandler):
             'is_new':True, #always mark system data as new
         }
         hasher = hashlib.md5()
-        stat = os.stat(fpath)
         with open(fpath,'r') as f:
             text = f.read()
             hasher.update(text)
             doc['text'] = text
             doc['hash'] = hasher.hexdigest()
-        self.queue.append(doc)
+        if fpath not in self.data or doc['hash'] != self.data[fpath]['hash']:
+            self.queue.append(doc)
+            self.data[fpath] = {'hash':doc['hash']}
         return True
 
     def log(self,level,msg):
         if self._logger is not None:
             getattr(self._logger,level)(msg)
+        else:
+            print('have level:{0} with msg:{1} but no logger.'.format(level,msg))
 
     def on_modified(self,event):
         self.get_data(event.src_path)
