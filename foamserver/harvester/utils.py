@@ -4,18 +4,19 @@ import glob
 import json
 import hashlib
 import datetime
-from dictdiffer import DictDiffer
+import logging
 from watchdog.events import FileSystemEventHandler, RegexMatchingEventHandler
+
+logger = logging.getLogger('harvester')
 
 class SystemEventHandler(RegexMatchingEventHandler):
     ignore_directories = True
 
-    def __init__(self,queue,path='system',data=None,logger=None):
+    def __init__(self,queue,path='system',data=None):
         super(SystemEventHandler,self).__init__(
             regexes=[os.path.join(path,'[a-z_\-A-Z]+')],
             ignore_directories=True
         )
-        self._logger = logger
         self.data = {} if data is None else data
         self.queue = queue
         for rel_path in os.listdir(path):
@@ -24,7 +25,6 @@ class SystemEventHandler(RegexMatchingEventHandler):
                 self.get_data(fpath)
 
     def get_data(self,fpath):
-        self.log('critical','just started processing')
         doc = {
             'path':fpath,
             'type':'system',
@@ -41,12 +41,6 @@ class SystemEventHandler(RegexMatchingEventHandler):
             self.queue.append(doc)
             self.data[fpath] = {'hash':doc['hash']}
         return True
-
-    def log(self,level,msg):
-        if self._logger is not None:
-            getattr(self._logger,level)(msg)
-        else:
-            print('have level:{0} with msg:{1} but no logger.'.format(level,msg))
 
     def on_modified(self,event):
         self.get_data(event.src_path)
@@ -93,18 +87,13 @@ class LogEventHandler(RegexMatchingEventHandler):
 
 class DatEventHandler(RegexMatchingEventHandler):
 
-    def __init__(self,queue,path,data=None,logger=None):
+    def __init__(self,queue,path,data=None):
         super(DatEventHandler,self).__init__(
             ignore_directories=True,regexes=['.*.dat'])
-        self._logger = logger
         self.data = {} if data is None else data
         self.queue = queue
         for fpath in glob.glob(os.path.join(path,'**/**/*.dat')):
             self.update_data(fpath)
-
-    def log(self,level,msg):
-        if self._logger is not None:
-            getattr(self._logger,level)(msg)
 
     def update_data(self,fpath):
         stat = os.stat(fpath)
@@ -134,7 +123,7 @@ class DatEventHandler(RegexMatchingEventHandler):
                         for i,col in enumerate(d['meta']['head']):
                             data[col].append(dline[i])
                     except ValueError:
-                        self.log('error','failed to get dat: {0}'.format(line))
+                        logger.error('failed to get dat: {0}'.format(line))
                 d['line'] += 1
             d['last_pos'] = f.tell()
         self.queue.append(

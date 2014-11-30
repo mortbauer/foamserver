@@ -81,7 +81,7 @@ class Harvester(object):
             self.data['system'] = {}
         observer.schedule(
             SystemEventHandler(
-                self.msgs,'system',self.data['system'],logger=self._logger),
+                self.msgs,'system',self.data['system']),
             'system',recursive=False)
         #observer.schedule(
             #SystemEventHandler(
@@ -91,7 +91,7 @@ class Harvester(object):
             self.data['postProcessing'] = {}
         observer.schedule(
             DatEventHandler(
-                self.msgs,'postProcessing',self.data['postProcessing'],logger=self._logger),
+                self.msgs,'postProcessing',self.data['postProcessing']),
             'postProcessing',recursive=True)
         if not 'logs' in self.data:
             self.data['logs'] = {}
@@ -185,11 +185,11 @@ class Harvester(object):
             getattr(self._logger,level)(msg)
 
     def add_logger(self):
-        self._logger = logging.getLogger('harvester_{0}'.format(self.project))
-        self._logger.setLevel(logging.CRITICAL)
+        self._logger = logging.getLogger('harvester')
+        self._logger.setLevel(logging.INFO)
         fh = logging.FileHandler(self.logfile)
-        fh.setLevel(logging.DEBUG)
-        fm = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        fh.setLevel(logging.INFO)
+        fm = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         fh.setFormatter(fm)
         self._logger.addHandler(fh)
 
