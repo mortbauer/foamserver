@@ -51,6 +51,18 @@ class KeyTransform(SONManipulator):
             key = key.replace(rep,it)
         return key
 
+    def transform_incoming_list(self,son,collection):
+        for i,value in enumerate(son):
+            if isinstance(value,dict):
+                son[i] = self.transform_incoming(value,collection)
+        return son
+
+    def transform_outgoing_list(self,son,collection):
+        for i,value in enumerate(son):
+            if isinstance(value,dict):
+                son[i] = self.transform_outgoing(value,collection)
+        return son
+
     def transform_incoming(self, son, collection):
         """Recursively replace all keys that need transforming."""
         for (key, value) in son.items():
@@ -65,6 +77,8 @@ class KeyTransform(SONManipulator):
                     break
                 elif isinstance(value, dict):  # recurse into sub-docs
                     son[key] = self.transform_incoming(value, collection)
+                elif isinstance(value, list):  # recurse into sub-docs
+                    son[key] = self.transform_incoming_list(value, collection)
         return son
 
     def transform_outgoing(self, son, collection):
@@ -79,6 +93,8 @@ class KeyTransform(SONManipulator):
                         son[self.revert_key(key)] = son.pop(key)
                 elif isinstance(value, dict):  # recurse into sub-docs
                     son[key] = self.transform_outgoing(value, collection)
+                elif isinstance(value, list):  # recurse into sub-docs
+                    son[key] = self.transform_outgoing_list(value, collection)
         return son
 
 class FoamServer(object):
@@ -119,10 +135,12 @@ class FoamServer(object):
                 'host':host,
                 'harvester_starttime':harvester_starttime,
             }
-            if 'ctime' in d:
-                base_doc['ctime'] = d['ctime']
             doc = self.db[d['type']].find_one(base_doc)
-            if doc is None:
+            if doc is None or (doc is not None and d['is_new']):
+                if doc is None:
+                    base_doc['_n'] = 0
+                else:
+                    base_doc['_n'] = doc['_n'] + 1
                 doc = base_doc
                 if d['type'] == 'log':
                     doc['data'] = {'loglines':{d['timestamp']:d['loglines']}}
@@ -142,9 +160,6 @@ class FoamServer(object):
                     self.log('error','type {0} unknown for: {1}'.format(d['type'],base_doc))
                 self.db[d['type']].insert(doc)
             else:
-                if 'is_new' in d:
-                    self.log('warning','data marked as is_new but isn\'t: {0}'.format(base_doc))
-                    continue
                 if d['type'] == 'log':
                     self.db[d['type']].update(
                         {'_id':doc['_id']},
@@ -202,8 +217,8 @@ class FoamServer(object):
         while not self._stop:
             #  Wait for next request from client
             msg = self.socket.recv()
-            self.socket.send(json.dumps({'state':'Ok'}))
             self.process_msg(msg)
+            self.socket.send(json.dumps({'state':'Ok'}))
         self.teardown()
 
     def teardown(self):
