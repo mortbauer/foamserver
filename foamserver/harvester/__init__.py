@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import zmq
+import stat
 import json
 import yaml
 import time
@@ -15,6 +16,15 @@ import logging
 from watchdog.observers import Observer
 from .utils import SystemEventHandler, DatEventHandler, LogEventHandler
 
+fmt = '%(asctime)s - %(levelname)s - %(message)s'
+logging.basicConfig(level=logging.ERROR,format=fmt)
+logger = logging.getLogger('harvester')
+logger.setLevel(logging.INFO)
+fh = logging.FileHandler('.harvester.log')
+fh.setLevel(logging.INFO)
+fm = logging.Formatter(fmt)
+fh.setFormatter(fm)
+logger.addHandler(fh)
 
 class DictEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -33,7 +43,6 @@ class Harvester(object):
         self._socket = None
         self._stop = False
         self._started = False
-        self._logger = None
         self._oneshot = False
         self.load_conf()
         self.context = zmq.Context()
@@ -42,8 +51,6 @@ class Harvester(object):
             self.conf.get('host','localhost'),
             self.conf.get('port',5051))
         self.data = {} if data is None else data
-        if logging:
-            self.add_logger()
         self.load_state()
         self.create_observer()
 
@@ -57,10 +64,6 @@ class Harvester(object):
             self.project = self.conf['project']
         except KeyError:
             raise Exception('you need to specify a project name in the configuration')
-        if 'logfile' in self.conf:
-            self.logfile = self.conf['logfile']
-        else:
-            self.logfile = '.harvester.log'
 
     def load_state(self):
         if not 'msgs' in self.data:
@@ -69,7 +72,7 @@ class Harvester(object):
             with open(self.PERSISTENCE,'r') as f:
                 self.data.update(json.loads(f.read()))
         except:
-            self.log('error','failed to load {0}'.format(self.PERSISTENCE))
+            logger.error('failed to load {0}'.format(self.PERSISTENCE))
         finally:
             if not 'harvester_starttime' in self.data:
                 self.data['harvester_starttime'] = datetime.datetime.utcnow()
@@ -126,11 +129,11 @@ class Harvester(object):
             if res['state'] == 'Ok':
                 del self.msgs[:n]
         except zmq.error.Again:
-            self.log('error','zmq error, try reconnect')
+            logger.error('zmq error, try reconnect')
             self.close_socket()
         except zmq.error.ZMQError as e:
             if self._stop:
-                self.log('debug','ignore zmq.error.ZMQError _stop == True')
+                logger.debug('ignore zmq.error.ZMQError _stop == True')
             else:
                 raise zmq.error.ZMQError(e)
 
@@ -159,10 +162,14 @@ class Harvester(object):
 
     def save_state(self):
         try:
+            if os.path.isfile(self.PERSISTENCE):
+                os.chmod(self.PERSISTENCE,stat.S_IWRITE|stat.S_IRGRP|stat.S_IROTH)
             with open(self.PERSISTENCE,'w') as f:
                 f.write(json.dumps(self.data,indent=2,cls=DictEncoder))
+            # mark as read only
+            os.chmod(self.PERSISTENCE,stat.S_IREAD|stat.S_IRGRP|stat.S_IROTH)
         except KeyboardInterrupt:
-            self.log('critical','interrupted the save state')
+            logger.critical('interrupted the save state')
 
     def teardown(self):
         if self._started:
@@ -179,19 +186,6 @@ class Harvester(object):
             self._oneshot = True
             self._stop = False
             self.start_send_recv_loop()
-
-    def log(self,level,msg):
-        if self._logger:
-            getattr(self._logger,level)(msg)
-
-    def add_logger(self):
-        self._logger = logging.getLogger('harvester')
-        self._logger.setLevel(logging.INFO)
-        fh = logging.FileHandler(self.logfile)
-        fh.setLevel(logging.INFO)
-        fm = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        fh.setFormatter(fm)
-        self._logger.addHandler(fh)
 
 
 @click.group()
