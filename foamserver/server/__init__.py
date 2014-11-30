@@ -155,7 +155,7 @@ class FoamServer(object):
                         'file':path_pieces[-1],
                     }
                 elif d['type'] == 'system':
-                    doc['data'] = {'doc':d['doc'],'diffs':{}}
+                    doc['data'] = {'text':d['text']}
                 else:
                     self.log('error','type {0} unknown for: {1}'.format(d['type'],base_doc))
                 self.db[d['type']].insert(doc)
@@ -165,15 +165,6 @@ class FoamServer(object):
                         {'_id':doc['_id']},
                         {'$set':{
                             'data.loglines.{0}'.format(d['timestamp']):d['loglines']}}
-                    )
-                elif d['type'] == 'system':
-                    if 'doc' in d:
-                        diffs = list(self.differ.diff(doc['data']['doc'],d['doc']))
-                    else:
-                        diffs = d['diffs']
-                    self.db[d['type']].update(
-                        {'_id':doc['_id']},
-                        {'$set':{'data.diffs.{0}'.format(d['timestamp']):diffs}}
                     )
                 elif d['type'] == 'dat':
                     self.db[d['type']].update(

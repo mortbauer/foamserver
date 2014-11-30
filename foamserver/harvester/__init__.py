@@ -13,8 +13,15 @@ import socket
 import datetime
 import logging
 from watchdog.observers import Observer
-from .utils import PyFoamDictEncoder,SystemEventHandler, DatEventHandler, LogEventHandler
+from .utils import SystemEventHandler, DatEventHandler, LogEventHandler
 
+
+class DictEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj,datetime.datetime):
+            return obj.strftime("%Y-%m-%dT%H:%M:%S")
+        else:
+            return json.JSONEncoder.default(self, obj)
 
 class Harvester(object):
     REQUEST_TIMEOUT = 2500
@@ -112,7 +119,7 @@ class Harvester(object):
             'host':self.hostname,
             'harvester_starttime':self.data['harvester_starttime'],
             'data':self.msgs[:n],
-        },cls=PyFoamDictEncoder)
+        },cls=DictEncoder)
         try:
             self.socket.send(msg)
             res = json.loads(self.socket.recv())
@@ -153,7 +160,7 @@ class Harvester(object):
     def save_state(self):
         try:
             with open(self.PERSISTENCE,'w') as f:
-                f.write(json.dumps(self.data,indent=2,cls=PyFoamDictEncoder))
+                f.write(json.dumps(self.data,indent=2,cls=DictEncoder))
         except KeyboardInterrupt:
             self.log('critical','interrupted the save state')
 
