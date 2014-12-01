@@ -169,10 +169,15 @@ class FoamServer(object):
                 elif d['type'] == 'dat':
                     self.db[d['type']].update(
                         {'_id':doc['_id']},
-                        {'$push':{'data.{0}'.format(x):{'$each':d['data'][x]} for x in d['data']}}
+                        {'$push':{'data.time':{'$each':d['data'].pop('Time')}}}
+                    )
+                    self.db[d['type']].update(
+                        {'_id':doc['_id']},
+                        {'$push':{'data.data.{0}'.format(x):{'$each':d['data'][x]} for x in d['data']}}
                     )
                 else:
                     self.log('error','type {0} unknown for: {1}'.format(d['type'],base_doc))
+        self.log('info','processed msg for project {0} from host: {1}'.format(project,host))
 
     def load_conf(self,conffile):
         if conffile is None:
