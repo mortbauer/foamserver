@@ -96,6 +96,11 @@ class Harvester(object):
             DatEventHandler(
                 self.msgs,'postProcessing',self.data['postProcessing']),
             'postProcessing',recursive=True)
+        for path in self.conf.get('postProcessing',[]):
+            observer.schedule(
+                DatEventHandler(
+                    self.msgs,path,self.data['postProcessing']),
+                path,recursive=True)
         if not 'logs' in self.data:
             self.data['logs'] = {}
         observer.schedule(
