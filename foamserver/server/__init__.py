@@ -155,7 +155,11 @@ class FoamServer(object):
                         'file':path_pieces[-1],
                     }
                 elif d['type'] == 'system':
-                    doc['data'] = {'text':d['text']}
+                    doc['data'] = {
+                        'text':d['text'],
+                        'timestamp':d['timestamp'],
+                        'hash':d['hash'],
+                    }
                 else:
                     self.log('error','type {0} unknown for: {1}'.format(d['type'],base_doc))
                 self.db[d['type']].insert(doc)
