@@ -7,6 +7,7 @@ import click
 import signal
 import logging
 import pymongo
+import datetime
 import dictdiffer
 from pymongo.son_manipulator import SONManipulator
 
@@ -217,8 +218,15 @@ class FoamServer(object):
         while not self._stop:
             #  Wait for next request from client
             msg = self.socket.recv()
-            self.process_msg(msg)
             self.socket.send(json.dumps({'state':'Ok'}))
+            try:
+                self.process_msg(msg)
+            except:
+                self.log('critical','failed to log msg')
+                self.db['failed'].insert({
+                    'msg':msg,
+                    'fail_time':datetime.datetime.isoformat(
+                        datetime.datetime.utcnow())})
         self.teardown()
 
     def teardown(self):
