@@ -112,10 +112,12 @@ class FoamServer(object):
         self.db = self.client['ventilator']
         self.db.add_son_manipulator(KeyTransform())
         self.differ = dictdiffer.DictDiffer()
+        self._stop = False
+
+    def start_listen(self):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         self.socket.bind("tcp://*:{0}".format(self.PORT))
-        self._stop = False
         print("listening on port: {0}".format(self.PORT))
         self.log('info','started and listening on port: {0}'.format(self.PORT))
 
@@ -136,7 +138,12 @@ class FoamServer(object):
                 'host':host,
                 'harvester_starttime':harvester_starttime,
             }
-            doc = self.db[d['type']].find_one(base_doc)
+            res = self.db[d['type']].aggregate([
+                {'$match':base_doc},{'$sort':{'_n':-1}},{'$limit':1}])
+            if res['ok'] and len(res['result']):
+                doc = res['result'][0]
+            else:
+                doc = None
             if doc is None or (doc is not None and d['is_new']):
                 if doc is None:
                     base_doc['_n'] = 0
@@ -235,6 +242,7 @@ class FoamServer(object):
         self.context.term()
 
     def start(self):
+        self.start_listen()
         self.start_loop()
 
     def stop(self):
