@@ -34,7 +34,7 @@ class DictEncoder(json.JSONEncoder):
             return json.JSONEncoder.default(self, obj)
 
 class Harvester(object):
-    REQUEST_TIMEOUT = 2500
+    REQUEST_TIMEOUT = 5500
     SLEEP_TIME = 2
     PERSISTENCE = '.harvester.json'
     CONF = 'harvester.yaml'
