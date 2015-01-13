@@ -156,7 +156,7 @@ class FoamServer(object):
                     path_pieces = d['path'].split('/')
                     doc['data'] = {
                         'data':d['data'],
-                        'time':d['data'].pop('Time'),
+                        'time':[float(x) for x in d['data'].pop('Time')],
                         'meta':d['meta'],
                         'starttime':float(path_pieces[-2]),
                         'name':path_pieces[-3],

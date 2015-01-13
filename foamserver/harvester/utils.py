@@ -5,10 +5,12 @@ import json
 import hashlib
 import datetime
 import logging
+import pyparsing
 from watchdog.events import FileSystemEventHandler, RegexMatchingEventHandler
 
 logger = logging.getLogger('harvester')
-
+pline = pyparsing.OneOrMore(pyparsing.nestedExpr())
+phead = pyparsing.OneOrMore(pyparsing.Word(pyparsing.alphas)+pyparsing.nestedExpr())
 class SystemEventHandler(RegexMatchingEventHandler):
     ignore_directories = True
 
@@ -114,16 +116,33 @@ class DatEventHandler(RegexMatchingEventHandler):
                     if ':' in line:
                         label,val = line.lstrip()[1:].split(':')
                         d['meta'][label.strip()] = val.strip()
-                    else:
-                        d['meta']['head'] = line.split()[1:]
+                    elif len(line.split())>2:
+                        if not 'name' in d['meta']:
+                            d['meta']['head'] = line.split()[1:]
+                        else:
+                            l = line.split(' ',2)[1:]
+                            l1 = phead.parseString(l[1]).asList()
+                            h = [l[0]]
+                            for x in range(len(l1))[::2]:
+                                for i in range(3):
+                                    h.append('{0}_{1}'.format(l1[x],l1[x+1][i]))
+                            d['meta']['head'] = h
                         data = {x:[] for x in d['meta']['head']}
+                    else:
+                        d['meta']['name'] = line.lstrip()[1:]
                 else:
-                    try:
+                    if not 'name' in d['meta']:
                         dline = [float(x) for x in line.split()]
-                        for i,col in enumerate(d['meta']['head']):
-                            data[col].append(dline[i])
-                    except ValueError:
-                        logger.error('failed to get dat: {0}'.format(line))
+                    else:
+                        l = line.split('\t',1)
+                        l1 = pline.parseString(l[1]).asList()
+                        dline = [l[0]]
+                        for x in l1:
+                            for i in range(3):
+                                dline.append([float(k) for k in x[i]])
+                    for i,col in enumerate(d['meta']['head']):
+                        data[col].append(dline[i])
+
                 d['line'] += 1
             d['last_pos'] = f.tell()
         self.queue.append(
