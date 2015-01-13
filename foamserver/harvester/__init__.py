@@ -52,7 +52,6 @@ class Harvester(object):
             self.conf.get('port',5051))
         self.data = {} if data is None else data
         self.load_state()
-        self.create_observer()
 
     def load_conf(self):
         if not os.path.isfile(self.CONF):
@@ -154,6 +153,7 @@ class Harvester(object):
 
     def observe(self):
         if not self._started:
+            self.create_observer()
             self.observer.start()
             self._started = True
             self._stop = False
@@ -187,6 +187,7 @@ class Harvester(object):
 
     def oneshot(self):
         if not self._started:
+            self.create_observer()
             self._started = True
             self._oneshot = True
             self._stop = False
@@ -223,3 +224,51 @@ def oneshot():
         signal.signal(signal.SIGINT, interupt_handler)
         harvester.oneshot()
 
+@run.command()
+def info():
+    try:
+        harvester = Harvester()
+    except KeyboardInterrupt:
+        print('catched keyboard interrupt on initalization')
+    else:
+        for key in harvester.data:
+            if key in ['msgs','harvester_starttime']:
+                continue
+            print('{0}:'.format(key))
+            for path in harvester.data[key]:
+                print('    {0}:'.format(path))
+
+@run.command()
+@click.argument('pattern')
+def reset_cache(pattern):
+    try:
+        harvester = Harvester()
+    except KeyboardInterrupt:
+        print('catched keyboard interrupt on initalization')
+    else:
+        PATTERN = re.compile(pattern)
+        data = {}
+        for key in harvester.data:
+            if key in ['msgs','harvester_starttime']:
+                continue
+            data[key]=[]
+            for path in harvester.data[key]:
+                if PATTERN.match(path):
+                    data[key].append(path)
+        # ask
+        print('paths marked for resetting:\n')
+        any_matched = False
+        for key in data:
+            if len(data[key]):
+                print('{0}:'.format(key))
+            for path in data[key]:
+                any_matched = True
+                print('    {0}:'.format(path))
+        if any_matched:
+            if click.confirm('\nreally clear cache for marked paths ?'):
+                for key in data:
+                    for path in data[key]:
+                        del harvester.data[key][path]
+            harvester.save_state()
+        else:
+            print('nothing matched.')
