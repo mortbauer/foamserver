@@ -19,6 +19,7 @@ setup(
                'foamserver.server',
                'foamserver.harvester',
                'foamserver.foamparser',
+               'foamserver.postpro',
                ],
     platforms='any',
     entry_points = {
