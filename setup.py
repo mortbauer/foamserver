@@ -18,6 +18,7 @@ setup(
     packages =['foamserver',
                'foamserver.server',
                'foamserver.harvester',
+               'foamserver.foamparser',
                ],
     platforms='any',
     entry_points = {

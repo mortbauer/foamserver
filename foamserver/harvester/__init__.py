@@ -8,13 +8,41 @@ import stat
 import json
 import yaml
 import time
+import copy
 import click
 import signal
 import socket
 import datetime
 import logging
 from watchdog.observers import Observer
+from watchdog.observers.api import ObservedWatch
 from .utils import SystemEventHandler, DatEventHandler, LogEventHandler
+
+VERSION = 0.2
+
+INITIAL_DATA = {
+    'cache':{'system':{},'log':{},'dat':{}},
+    'harvester_starttime':datetime.datetime.utcnow(),
+    'msgs':[],
+}
+
+INITIAL_CONFIG = {
+    'watch':{
+        'system':[{
+            'path':'system',
+            'regexes':['.*'],
+            'recursive':False,
+        }],'log':[{
+            'path':'./',
+            'regexes':['log\..*'],
+            'recursive':False,
+        }],'dat':[{
+            'path':'postProcessing',
+            'regexes':['.*\.dat'],
+            'recursive':True,
+        }]
+    }
+}
 
 fmt = '%(asctime)s - %(levelname)s - %(message)s'
 logging.basicConfig(level=logging.ERROR,format=fmt)
@@ -25,6 +53,59 @@ fh.setLevel(logging.INFO)
 fm = logging.Formatter(fmt)
 fh.setFormatter(fm)
 logger.addHandler(fh)
+
+
+def convert_from(data,version):
+    ndata = copy.deepcopy(INITIAL_DATA)
+    if version == 0.0:
+        ndata['cache']['system'] = data['system']
+        ndata['cache']['log'] = data['logs']
+        ndata['cache']['dat'] = data['postProcessing']
+        ndata['msgs'] = data['msgs']
+
+    return ndata
+
+
+def custom_schedule(self, event_handler, path, recursive=False):
+    """
+    Schedules watching a path and calls appropriate methods specified
+    in the given event handler in response to file system events.
+    :param event_handler:
+    An event handler instance that has appropriate event handling
+    methods which will be called by the observer in response to
+    file system events.
+    :type event_handler:
+    :class:`watchdog.events.FileSystemEventHandler` or a subclass
+    :param path:
+    Directory path that will be monitored.
+    :type path:
+    ``str``
+    :param recursive:
+    ``True`` if events will be emitted for sub-directories
+    traversed recursively; ``False`` otherwise.
+    :type recursive:
+    ``bool``
+    :return:
+    An :class:`ObservedWatch` object instance representing
+    a watch.
+    """
+    with self._lock:
+        watch = ObservedWatch(path, recursive)
+        self._add_handler_for_watch(event_handler, watch)
+        # If we don't have an emitter for this watch already, create it.
+        if self._emitter_for_watch.get(watch) is None:
+            emitter = self._emitter_class(event_queue=self.event_queue,
+            watch=watch,
+            timeout=self.timeout)
+            self._add_emitter(emitter)
+            if self.is_alive():
+                emitter.start()
+                self._watches.add(watch)
+        # call init
+        event_handler.init(path,recursive)
+    return watch
+
+Observer.schedule = custom_schedule
 
 class DictEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -50,8 +131,7 @@ class Harvester(object):
         self.server_addr = 'tcp://{0}:{1}'.format(
             self.conf.get('host','localhost'),
             self.conf.get('port',5051))
-        self.data = {} if data is None else data
-        self.load_state()
+        self.load_state(data)
 
     def load_conf(self):
         if not os.path.isfile(self.CONF):
@@ -63,48 +143,42 @@ class Harvester(object):
             self.project = self.conf['project']
         except KeyError:
             raise Exception('you need to specify a project name in the configuration')
-
-    def load_state(self):
-        if not 'msgs' in self.data:
-            self.data['msgs'] = []
         try:
-            with open(self.PERSISTENCE,'r') as f:
-                self.data.update(json.loads(f.read()))
-        except:
-            logger.error('failed to load {0}'.format(self.PERSISTENCE))
-        finally:
-            if not 'harvester_starttime' in self.data:
-                self.data['harvester_starttime'] = datetime.datetime.utcnow()
-            self.msgs = self.data['msgs']
+            self.watch = self.conf['watch']
+            assert type(self.watch) == dict
+        except KeyError:
+            raise Exception('you need to specify a project name in the configuration')
+
+    def load_state(self,data):
+        self.data = copy.deepcopy(INITIAL_DATA)
+        if data is not None:
+            self.data.update(data)
+        #try:
+        with open(self.PERSISTENCE,'r') as f:
+            data = json.loads(f.read())
+            stored_version = data.get('version',0.0)
+            if stored_version < 0.2:
+                data = convert_from(data,stored_version)
+            self.data.update(data)
+        #except:
+            #logger.error('failed to load {0}'.format(self.PERSISTENCE))
+        self.msgs = self.data['msgs']
+        self.cache = self.data['cache']
+        self.data['version'] = VERSION
 
     def create_observer(self):
         self.observer = observer = Observer()
-        if not 'system' in self.data:
-            self.data['system'] = {}
-        observer.schedule(
-            SystemEventHandler(
-                self.msgs,'system',self.data['system']),
-            'system',recursive=False)
-        #observer.schedule(
-            #SystemEventHandler(
-                #self.msgs,'0.00000000e+00',self.data['system']),
-            #'0.00000000e+00',recursive=False)
-        if not 'postProcessing' in self.data:
-            self.data['postProcessing'] = {}
-        observer.schedule(
-            DatEventHandler(
-                self.msgs,'postProcessing',self.data['postProcessing']),
-            'postProcessing',recursive=True)
-        for path in self.conf.get('postProcessing',[]):
-            observer.schedule(
-                DatEventHandler(
-                    self.msgs,path,self.data['postProcessing']),
-                path,recursive=True)
-        if not 'logs' in self.data:
-            self.data['logs'] = {}
-        observer.schedule(
-            LogEventHandler(
-                self.msgs,'./',self.data['logs']),'./',recursive=True)
+        for handler_type in self.watch:
+            if handler_type == 'system':
+                Handler = SystemEventHandler
+            elif handler_type == 'log':
+                Handler = LogEventHandler
+            elif handler_type == 'dat':
+                Handler = DatEventHandler
+            for item in self.watch[handler_type]:
+                observer.schedule(
+                    Handler(self.msgs,self.cache,regexes=item['regexes']),
+                    item['path'],recursive=item.get('recursive'))
 
     @property
     def socket(self):
@@ -231,11 +305,9 @@ def info():
     except KeyboardInterrupt:
         print('catched keyboard interrupt on initalization')
     else:
-        for key in harvester.data:
-            if key in ['msgs','harvester_starttime']:
-                continue
+        for key in harvester.cache:
             print('{0}:'.format(key))
-            for path in harvester.data[key]:
+            for path in harvester.cache[key]:
                 print('    {0}:'.format(path))
 
 @run.command()
@@ -248,11 +320,9 @@ def reset_cache(pattern):
     else:
         PATTERN = re.compile(pattern)
         data = {}
-        for key in harvester.data:
-            if key in ['msgs','harvester_starttime']:
-                continue
+        for key in harvester.cache:
             data[key]=[]
-            for path in harvester.data[key]:
+            for path in harvester.cache[key]:
                 if PATTERN.match(path):
                     data[key].append(path)
         # ask
@@ -268,7 +338,18 @@ def reset_cache(pattern):
             if click.confirm('\nreally clear cache for marked paths ?'):
                 for key in data:
                     for path in data[key]:
-                        del harvester.data[key][path]
+                        del harvester.cache[key][path]
             harvester.save_state()
         else:
             print('nothing matched.')
+
+@run.command()
+def init():
+    if not os.path.exists(Harvester.CONF) or \
+            click.confirm('file harvester.yaml already exists, should I really overwrite it?'):
+        project = str(click.prompt('project name'))
+        config = copy.deepcopy(INITIAL_CONFIG)
+        config['project'] = project
+        with open(Harvester.CONF,'w') as f:
+            yaml.dump(config,f)
+

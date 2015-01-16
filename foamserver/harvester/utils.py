@@ -11,20 +11,25 @@ from watchdog.events import FileSystemEventHandler, RegexMatchingEventHandler
 logger = logging.getLogger('harvester')
 pline = pyparsing.OneOrMore(pyparsing.nestedExpr())
 phead = pyparsing.OneOrMore(pyparsing.Word(pyparsing.alphas)+pyparsing.nestedExpr())
-class SystemEventHandler(RegexMatchingEventHandler):
-    ignore_directories = True
 
-    def __init__(self,queue,path='system',data=None):
+class SystemEventHandler(RegexMatchingEventHandler):
+
+    def __init__(self,queue,cache,regexes=['[a-z_\-A-Z]+']):
         super(SystemEventHandler,self).__init__(
-            regexes=[os.path.join(path,'[a-z_\-A-Z]+')],
-            ignore_directories=True
-        )
-        self.data = {} if data is None else data
+            regexes=regexes,ignore_directories=True)
+        self.data = cache['system']
         self.queue = queue
-        for rel_path in os.listdir(path):
-            fpath = os.path.join(path,rel_path)
-            if os.path.isfile(fpath):
-                self.get_data(fpath)
+
+    def init(self,path,recursive):
+        if recursive:
+            for root, dirs, files in os.walk(path):
+                for p in files:
+                    if any(r.match(p) for r in self.regexes):
+                        self.get_data(os.path.join(root,p))
+        else:
+            for p in os.listdir(path):
+                if any(r.match(p) for r in self.regexes):
+                    self.get_data(os.path.join(path,p))
 
     def get_data(self,fpath):
         doc = {
@@ -49,18 +54,23 @@ class SystemEventHandler(RegexMatchingEventHandler):
 
 class LogEventHandler(RegexMatchingEventHandler):
 
-    def __init__(self,queue,path='./',data=None):
+    def __init__(self,queue,cache,regexes=['log\.']):
         super(LogEventHandler,self).__init__(
-            regexes=[os.path.join(path,x) for x in [
-                'log\.[a-zA-Z.0-9]+$','slurm-[a-zA-Z0-9]+\.out','FOAM\.o[0-9]+']])
-        self.data = {} if data is None else data
+            regexes=regexes,ignore_directories=True)
+        self.data = cache['log']
         self.queue = queue
-        for rel_path in os.listdir(path):
-            for pattern in self.regexes:
-                fpath = os.path.join(path,rel_path)
-                if pattern.match(fpath):
-                    self.process_lines(fpath)
-                    break
+
+
+    def init(self,path,recursive):
+        if recursive:
+            for root, dirs, files in os.walk(path):
+                for p in files:
+                    if any(r.match(p) for r in self.regexes):
+                        self.process_lines(os.path.join(root,p))
+        else:
+            for p in os.listdir(path):
+                if any(r.match(p) for r in self.regexes):
+                    self.process_lines(os.path.join(path,p))
 
     def process_lines(self,fpath):
         is_new = False
@@ -83,21 +93,29 @@ class LogEventHandler(RegexMatchingEventHandler):
                      'loglines':data})
             d['last_pos'] = f.tell()
 
-
     def on_modified(self,event):
         self.process_lines(event.src_path)
 
 class DatEventHandler(RegexMatchingEventHandler):
 
-    def __init__(self,queue,path,data=None):
+    def __init__(self,queue,cache,regexes=['.*\.dat']):
         super(DatEventHandler,self).__init__(
-            ignore_directories=True,regexes=['.*.dat'])
-        self.data = {} if data is None else data
+            ignore_directories=True,regexes=regexes)
+        self.data = cache['dat']
         self.queue = queue
-        for fpath in glob.glob(os.path.join(path,'**/**/*.dat')):
-            self.update_data(fpath)
 
-    def update_data(self,fpath):
+    def init(self,path,recursive):
+        if recursive:
+            for root, dirs, files in os.walk(path):
+                for p in files:
+                    if any(r.match(p) for r in self.regexes):
+                        self.process_lines(os.path.join(root,p))
+        else:
+            for p in os.listdir(path):
+                if any(r.match(p) for r in self.regexes):
+                    self.process_lines(os.path.join(path,p))
+
+    def process_lines(self,fpath):
         stat = os.stat(fpath)
         is_new = False
         if fpath not in self.data or stat.st_size < self.data[fpath]['last_pos']:
@@ -156,5 +174,5 @@ class DatEventHandler(RegexMatchingEventHandler):
         return True
 
     def on_modified(self,event):
-        d = self.update_data(event.src_path)
+        d = self.process_lines(event.src_path)
 
