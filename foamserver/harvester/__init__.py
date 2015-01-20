@@ -190,6 +190,7 @@ class Harvester(object):
         # insert into reliability dict
         self.msgs_not_confirmed[msg_hash] = msg
         # send the msg
+        logger.info('sending: {0}'.format(doc['path']))
         self._server_pull_socket.send_multipart(['new_msg',msg])
 
     def _main_control_task(self):
@@ -261,7 +262,7 @@ class Harvester(object):
             logger.info('forcing teardown')
             self._forced_teardown()
         else:
-            slef._register_soft_teardown()
+            self._register_soft_teardown()
         signal.signal(signal.SIGINT, self.interrupt_handler)
 
     def interrupt_handler(self,signum,frame):
