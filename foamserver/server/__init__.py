@@ -1,4 +1,5 @@
 import os
+import sys
 import zmq
 import time
 import json
@@ -7,189 +8,279 @@ import click
 import signal
 import logging
 import pymongo
+import tornado
+import threading
 import datetime
-import dictdiffer
-from pymongo.son_manipulator import SONManipulator
+import collections
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from zmq.eventloop import ioloop, zmqstream
+
+fmt = '%(asctime)s - %(levelname)s - %(message)s'
+logging.basicConfig(level=logging.ERROR,format=fmt)
+logger = logging.getLogger('foamserver_server')
+logger.setLevel(logging.INFO)
+fm = logging.Formatter(fmt)
+
+class DatPostProcessor(object):
+    def __call__(self,docs,postdoc):
+        ncols = len(docs[0]['data'][-1]['data'])
+        data = [[] for i in range(ncols)]
+        result = {
+            '$max':{'n_max':docs[-1]['n_max']},
+            '$min':{'n_min':docs[0]['n_min']},
+            '$set':{
+                'file':docs[0]['file'],
+                'name':docs[0]['name'],
+                'starttime':docs[0]['starttime'],
+            }
+        }
+        # the docs need to be in sorted order
+        for doc in docs:
+            # the lines in the docs are anyways in sorted order
+            for line in doc['data']:
+                if line['n'] <2:
+                    continue
+                elif line['n'] == 2:
+                    result['$set']['head'] = head = line['data']
+                else:
+                    for i in range(ncols):
+                        data[i].append(line['data'][i])
+
+        head = postdoc.get('head',result['$set'].get('head'))
+        if head is None:
+            logger.error('no head for {0}'.format(postdoc['_id']))
+        else:
+            result['$push'] = push = {}
+            for i,x in enumerate(head):
+                push['data.{0}'.format(x)] = {'$each':data[i]}
+        return postdoc,result
+
+
+class LogPostProcessor(object):
+    def __call__(self,docs,postdoc):
+        res = {
+            'iterations':{'time':[],'initial residual':{}},
+            'outer_iterations':{},
+            'corrector':{},
+        }
+        initial = {}
+        n_iter = 0
+        result = {
+            '$max':{'n_max':docs[-1]['n_max']},
+            '$min':{'n_min':docs[0]['n_min']},
+        }
+
+        for doc in docs:
+            for line in doc['data']:
+                if not 'data' in line:
+                    continue
+                data = line['data']
+                if 'time' in data:
+                    res['iterations']['time'].append(data['time'])
+                elif 'variable' in data:
+                    if data['variable'] not in initial:
+                        initial[data['variable']] = []
+                    initial[data['variable']].append(data['initial residual'])
+        result['$push'] = push = {}
+        for x in initial:
+            push['data.iterations.initial residual.{0}'.format(x)] = {'$each':initial[x]}
+        return postdoc,result
+
 
 class FoamServerException(Exception):
     pass
 
-class KeyTransform(SONManipulator):
-    """Transforms keys going to database and restores them coming out.
-    adapted from gist: https://gist.github.com/8051599.git
 
-    This allows keys with dots in them to be used (but does break searching on
-    them unless the find command also uses the transform.
+class LogProcessor(object):
+    def __call__(self,doc):
+        for line in doc['data']:
+            self.process_line(line)
+        return doc
 
-    Example & test:
-        # To allow `.` (dots) in keys
-        import pymongo
-        client = pymongo.MongoClient("mongodb://localhost")
-        db = client['delete_me']
-        db.add_son_manipulator(KeyTransform(".", "_dot_"))
-        db['mycol'].remove()
-        db['mycol'].update({'_id': 1}, {'127.0.0.1': 'localhost'}, upsert=True,
-                           manipulate=True)
-        print db['mycol'].find().next()
-        print db['mycol'].find({'127_dot_0_dot_0_dot_1': 'localhost'}).next()
+    def process_line(self,line):
+        text = line['text']
+        if text.startswith('Time ='):
+            line['data'] = {
+                'time':float(text.split(' = ')[1]),
+            }
+        elif 'Solving for ' in text:
+            fields = text.split(',')
+            solver, variable = fields[0].split(':')
+            line['data'] = {
+                'variable':variable.split()[-1],
+                'solver':solver,
+                'n_iter':int(fields[3].split()[-1]),
+            }
+            r = fields[1].split(' = ')
+            line['data'][r[0].strip().lower()] = float(r[1])
+            r = fields[2].split(' = ')
+            line['data'][r[0].strip().lower()] = float(r[1])
+        elif 'continuity errors' in text:
+            line['data'] = {}
+            for item in text.split(':')[1].split(','):
+                r = item.split(' = ')
+                line['data'][r[0].strip()] = float(r[1])
+        elif text.startswith('ExecutionTime'):
+            line['data'] = {}
+            for item in text.split('  '):
+                key,rest = item.split(' = ')
+                value,unit = rest.split()
+                line['data'][key.strip()] = {'value':float(value),'unit':unit}
 
-    Note: transformation could be easily extended to be more complex.
-    """
-    REPLACE = [('.','__dot__'),('$','__dollar__')]
 
-    def __init__(self,replace=[]):
-        self.replace = self.REPLACE + replace
+class SystemProcessor(object):
+    def __call__(self,doc):
+        return doc
 
-    def transform_key(self, key):
-        """Transform key for saving to database."""
-        for it,rep in self.replace:
-            key = key.replace(it,rep)
-        return key
 
-    def revert_key(self, key):
-        """Restore transformed key returning from database."""
-        for it,rep in self.replace:
-            key = key.replace(rep,it)
-        return key
+class DatProcessor(object):
+    def __call__(self,doc):
+        path_pieces = doc['path'].split('/')
+        doc['file'] = path_pieces[-1]
+        doc['starttime'] = path_pieces[-2]
+        doc['name'] = path_pieces[-3]
+        if 'forces' in path_pieces[-1]:
+            self.process_forces(doc)
+        else:
+            self.process_scalar(doc)
+        return doc
 
-    def transform_incoming_list(self,son,collection):
-        for i,value in enumerate(son):
-            if isinstance(value,dict):
-                son[i] = self.transform_incoming(value,collection)
-        return son
 
-    def transform_outgoing_list(self,son,collection):
-        for i,value in enumerate(son):
-            if isinstance(value,dict):
-                son[i] = self.transform_outgoing(value,collection)
-        return son
+    def process_forces(self,doc):
+        for line in doc['data']:
+            n = line['n']
+            text = line['text']
+            line['data'] = res = []
+            if n == 2:
+                comment,_time,fields = text.split(' ',2)
+                res.append(_time)
+                for main_field in fields.strip().split(') '):
+                    key,minor_fields = main_field.split('(')
+                    for minor in minor_fields.split():
+                        res.append('{0}_{1}'.format(key,minor))
+            elif n > 2:
+                _time,_fields = text.strip().split('\t')
+                res.append(float(_time))
+                for main_field in _fields.split(') '):
+                    sub_res = []
+                    for x in main_field.strip('()').split():
+                        sub_res.append(float(x))
+                    res.append(sub_res)
 
-    def transform_incoming(self, son, collection):
-        """Recursively replace all keys that need transforming."""
-        for (key, value) in son.items():
-            for it,rep in self.replace:
-                if it in key:
-                    if isinstance(value, dict):
-                        son[self.transform_key(key)] = self.transform_incoming(
-                            son.pop(key), collection)
-                    else:
-                        son[self.transform_key(key)] = son.pop(key)
-                    # we replace for all anyways so skip loop
-                    break
-                elif isinstance(value, dict):  # recurse into sub-docs
-                    son[key] = self.transform_incoming(value, collection)
-                elif isinstance(value, list):  # recurse into sub-docs
-                    son[key] = self.transform_incoming_list(value, collection)
-        return son
 
-    def transform_outgoing(self, son, collection):
-        """Recursively restore all transformed keys."""
-        for (key, value) in son.items():
-            for it,rep in self.replace:
-                if rep in key:
-                    if isinstance(value, dict):
-                        son[self.revert_key(key)] = self.transform_outgoing(
-                            son.pop(key), collection)
-                    else:
-                        son[self.revert_key(key)] = son.pop(key)
-                elif isinstance(value, dict):  # recurse into sub-docs
-                    son[key] = self.transform_outgoing(value, collection)
-                elif isinstance(value, list):  # recurse into sub-docs
-                    son[key] = self.transform_outgoing_list(value, collection)
-        return son
+    def process_scalar(self,doc):
+        for line in doc['data']:
+            n = line['n']
+            text = line['text']
+            line['data'] = res = []
+            if n == 2:
+                line['data'] = text.strip('\n# ').split('\t',2)
+            elif n > 2:
+                for x in text.strip('\n#').split('\t',2):
+                    res.append(float(x))
+
 
 class FoamServer(object):
-    PORT = 5051
+    SERVER_PUSH_PORT = 5051
+    SERVER_PULL_PORT = 5052
+    SLEEP_TIME = 3
 
-    def __init__(self,conffile=None,logging=True):
+    def __init__(self,conffile=None,debug=False,loglevel='error'):
         try:
             self.client = pymongo.MongoClient('localhost',27017)
         except pymongo.errors.ConnectionFailure:
             raise FoamServerException('couldn\'t connect to mongodb on localhost:27017')
-        self._logger = None
+        if debug:
+            logger.setLevel(logging.DEBUG)
+        else:
+            logger.setLevel(loglevel.upper())
         self.load_conf(conffile)
-        self.add_logger()
+        self.add_logging_file_handler()
         self.db = self.client['ventilator']
-        self.db.add_son_manipulator(KeyTransform())
-        self.differ = dictdiffer.DictDiffer()
         self._stop = False
-
-    def start_listen(self):
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REP)
-        self.socket.bind("tcp://*:{0}".format(self.PORT))
-        print("listening on port: {0}".format(self.PORT))
-        self.log('info','started and listening on port: {0}'.format(self.PORT))
+        self._loop = ioloop.IOLoop.instance()
+        self.processors = {
+            'dat':DatProcessor(),
+            'log':LogProcessor(),
+            'system':SystemProcessor(),
+        }
+        self.post_processors = {
+            'dat_post':DatPostProcessor(),
+            'log_post':LogPostProcessor(),
+        }
+        self.executor = ProcessPoolExecutor(max_workers=4)
+        self._results = collections.deque()
+        self._main_control_loop = ioloop.PeriodicCallback(
+            self._main_control_task,self.SLEEP_TIME*1e3,self._loop)
 
-    def signal_handler(self,*args):
-        self.stop()
+    def _main_control_task(self):
+        for future in as_completed(self._results):
+            print(future.result()['path'])
 
-    def process_msg(self,msg):
-        payload = json.loads(msg)
-        project = payload['project']
-        host = payload['host']
-        harvester_starttime = payload['harvester_starttime']
-        data = payload['data']
-        for d in data:
-            base_doc = {
-                'project':project,
-                'path':d['path'],
-                'type':d['type'],
-                'host':host,
-                'harvester_starttime':harvester_starttime,
-            }
-            res = self.db[d['type']].aggregate([
-                {'$match':base_doc},{'$sort':{'_n':-1}},{'$limit':1}])
-            if res['ok'] and len(res['result']):
-                doc = res['result'][0]
+    def get_doc_id_for_post(self,doc):
+        return {
+            'project':doc['project'],
+            'path':doc['path'],
+            'root_path':doc['root_path'],
+            'initial':doc['initial'],
+            'host':doc['host'],
+        }
+
+    def post_process_callback(self,fn):
+        doc,res = fn.result()
+        ok = self.db[doc['type']].update({'_id':doc['_id']},res)
+        logger.info(
+            'postpro done for: {0}'.format(doc['path']))
+
+    def process_callback(self,fn):
+        doc = fn.result()
+        # update the processed doc
+        self.db[doc['type']].update({'_id':doc['_id']},doc)
+        logger.info('updated doc: {0}'.format(doc['path']))
+        # test if this doc exists in post
+        _id = self.get_doc_id_for_post(doc)
+        colname = '{0}_post'.format(doc['type'])
+        postdoc = self.db[colname].find_one(_id)
+        initial_postdoc = _id.copy()
+        initial_postdoc['type'] = colname
+        initial_postdoc['n_max'] = 0
+        initial_postdoc['n_min'] = 10000
+        initial_postdoc['modified'] = datetime.datetime.utcnow()
+        # decide following processing steps
+        if doc['type'] in ['log','dat']:
+            # we need to completely reprocess the doc
+            if postdoc is None or doc['n_min'] < postdoc['n_min']:
+                self.db[colname].update(_id,initial_postdoc,upsert=True)
+                docs = list(self.db[doc['type']].find(_id,sort=[('n_min',1)]))
+                postdoc = self.db[colname].find_one(_id)
             else:
-                doc = None
-            if doc is None or (doc is not None and d['is_new']):
-                if doc is None:
-                    base_doc['_n'] = 0
-                else:
-                    base_doc['_n'] = doc['_n'] + 1
-                doc = base_doc
-                if d['type'] == 'log':
-                    doc['data'] = {'loglines':{d['timestamp']:d['loglines']}}
-                elif d['type'] == 'dat':
-                    path_pieces = d['path'].split('/')
-                    doc['data'] = {
-                        'data':d['data'],
-                        'time':[float(x) for x in d['data'].pop('Time')],
-                        'meta':d['meta'],
-                        'starttime':float(path_pieces[-2]),
-                        'name':path_pieces[-3],
-                        'file':path_pieces[-1],
-                    }
-                elif d['type'] == 'system':
-                    doc['data'] = {
-                        'text':d['text'],
-                        'timestamp':d['timestamp'],
-                        'hash':d['hash'],
-                    }
-                else:
-                    self.log('error','type {0} unknown for: {1}'.format(d['type'],base_doc))
-                self.db[d['type']].insert(doc)
-            else:
-                if d['type'] == 'log':
-                    self.db[d['type']].update(
-                        {'_id':doc['_id']},
-                        {'$set':{
-                            'data.loglines.{0}'.format(d['timestamp']):d['loglines']}}
-                    )
-                elif d['type'] == 'dat':
-                    self.db[d['type']].update(
-                        {'_id':doc['_id']},
-                        {'$push':{'data.time':{'$each':d['data'].pop('Time')}}}
-                    )
-                    self.db[d['type']].update(
-                        {'_id':doc['_id']},
-                        {'$push':{'data.data.{0}'.format(x):{'$each':d['data'][x]} for x in d['data']}}
-                    )
-                else:
-                    self.log('error','type {0} unknown for: {1}'.format(d['type'],base_doc))
-        self.log('info','processed msg for project {0} from host: {1}'.format(project,host))
+                docs = [doc]
+        # submit next processing step
+        if colname in self.post_processors:
+            fn = self.executor.submit(
+                self.post_processors[colname],docs,postdoc)
+            fn.add_done_callback(self.post_process_callback)
+
+    def handle_msg(self,msg):
+        # traverse msg
+        msg_hash = hash(msg)
+        doc = json.loads(msg)
+        doc['type'] = colname = doc['type']
+        doc['hash'] = msg_hash
+        # insert the basic document
+        doc['_id'] = self.db[colname].insert(doc)
+        # send response to harvester
+        self.server_push_socket.send_multipart(
+            ['confirm',json.dumps({'hash':msg_hash})])
+        # log that we saved the doc
+        logger.debug('inserted for project: {0} path: {1}'.format(
+            doc['project'],doc['path']))
+        # submit the processing
+        if colname in self.processors:
+            fn = self.executor.submit(self.processors[colname],doc)
+            fn.add_done_callback(self.process_callback)
 
     def load_conf(self,conffile):
         if conffile is None:
@@ -221,53 +312,51 @@ class FoamServer(object):
         else:
             self.logfile = os.path.join(os.environ['HOME'],'.foamserver_server.log')
 
-    def start_loop(self):
-        while not self._stop:
-            #  Wait for next request from client
-            msg = self.socket.recv()
-            self.socket.send(json.dumps({'state':'Ok'}))
-            try:
-                self.process_msg(msg)
-            except:
-                self.log('critical','failed to log msg')
-                self.db['failed'].insert({
-                    'msg':msg,
-                    'fail_time':datetime.datetime.isoformat(
-                        datetime.datetime.utcnow())})
-        self.teardown()
+    def handle_response(self,msg):
+        if msg[0] == 'new_msg':
+            self.handle_msg(msg[1])
+
+    def connect(self):
+        self.server_push_socket = self.context.socket(zmq.PUSH)
+        self.server_push_socket.bind("tcp://*:{0}".format(self.SERVER_PUSH_PORT))
+        self.server_pull_socket = self.context.socket(zmq.PULL)
+        self.server_pull_socket.bind("tcp://*:{0}".format(self.SERVER_PULL_PORT))
+        self.stream = zmqstream.ZMQStream(self.server_pull_socket, self._loop)
+        self.stream.on_recv(self.handle_response)
 
     def teardown(self):
-        self.socket.close()
+        self.server_pull_socket.close(linger=0)
+        self.server_push_socket.close(linger=0)
         self.client.close()
         self.context.term()
 
     def start(self):
-        self.start_listen()
-        self.start_loop()
+        self.connect()
+        logger.info("started server")
+        #self._main_control_loop.start()
+        self._loop.start()
+        self.executor.shutdown(wait=True)
 
-    def stop(self):
-        self._stop = True
+    def interrupt_handler(self,signum,frame):
+        if multiprocessing.current_process().name == 'MainProcess':
+            print('catched interrupt, shutting down')
+            self._loop.stop()
 
-    def log(self,level,msg):
-        if self._logger:
-            getattr(self._logger,level)(msg)
-
-    def add_logger(self):
-        self._logger = logging.getLogger('foamserver')
-        self._logger.setLevel(logging.INFO)
+    def add_logging_file_handler(self):
         fh = logging.FileHandler(self.logfile)
         fh.setLevel(logging.INFO)
-        fm = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         fh.setFormatter(fm)
-        self._logger.addHandler(fh)
+        logger.addHandler(fh)
 
 
 @click.command()
-def main():
+@click.option('--debug/--no-debug')
+@click.option('--loglevel',default='error')
+def main(debug=False,loglevel='error'):
     try:
-        server = FoamServer()
-        server.start()
+        server = FoamServer(debug=debug,loglevel=loglevel)
     except KeyboardInterrupt:
-        print('catched keyboard interrupt on initalization')
-    except FoamServerException as e:
-        print(e)
+        print('catched keyboard interrupt, quitting')
+    else:
+        signal.signal(signal.SIGINT, server.interrupt_handler)
+        server.start()
