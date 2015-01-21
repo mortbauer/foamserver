@@ -6,12 +6,10 @@ import json
 import hashlib
 import datetime
 import logging
-import pyparsing
+import itertools
 from watchdog.events import FileSystemEventHandler, RegexMatchingEventHandler
 
 logger = logging.getLogger('harvester')
-pline = pyparsing.OneOrMore(pyparsing.nestedExpr())
-phead = pyparsing.OneOrMore(pyparsing.Word(pyparsing.alphas)+pyparsing.nestedExpr())
 
 class HarvesterEventHandler(RegexMatchingEventHandler):
     __metaclass__ = abc.ABCMeta
@@ -22,6 +20,7 @@ class HarvesterEventHandler(RegexMatchingEventHandler):
             ignore_directories=True)
         self.data = cache[self.TYPE]
         self.queue = queue
+        self.currently_processing = set()
 
     def init(self,path,recursive):
         if recursive:
@@ -38,9 +37,14 @@ class HarvesterEventHandler(RegexMatchingEventHandler):
         self.work(event.src_path)
 
     def work(self,path):
-        if self.test_reset(path):
-            self.initialize(path)
-        self.process(path)
+        if path in self.currently_processing:
+            logger.info('already processing: {0}'.format(path))
+        else:
+            self.currently_processing.add(path)
+            if self.test_reset(path):
+                self.initialize(path)
+            self.process(path)
+            self.currently_processing.remove(path)
 
     @abc.abstractmethod
     def process(self,path):
@@ -108,7 +112,10 @@ class DatEventHandler(HarvesterEventHandler):
         with open(path,'r') as f:
             f.seek(d['pos'])
             data = []
-            for i, line in enumerate(f):
+            for i in range(2000):
+                line = f.readline()
+                if not line:
+                    break
                 data.append({
                     'text':line,
                     'n':i+d['line_number']})
@@ -122,6 +129,9 @@ class DatEventHandler(HarvesterEventHandler):
                 'n_max':d['line_number'],
                 'initial':d['initial'],
                 'data':data})
+        if os.stat(path).st_size > d['pos']:
+            self.process(path)
+
 class LogEventHandler(DatEventHandler):
     REGEXES = ['log\.']
     TYPE = 'log'

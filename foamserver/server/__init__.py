@@ -11,6 +11,7 @@ import pymongo
 import tornado
 import threading
 import datetime
+import traceback
 import collections
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -22,10 +23,22 @@ logger = logging.getLogger('foamserver_server')
 logger.setLevel(logging.INFO)
 fm = logging.Formatter(fmt)
 
-class DatPostProcessor(object):
-    def __call__(self,docs,postdoc):
+class FoamServerException(Exception):
+    pass
+
+class BaseProcessor(object):
+    def __call__(self,doc,*args):
+        try:
+            return self.TYPE, doc, self.process(doc,*args)
+        except Exception as e:
+            print(traceback.format_exc())
+
+class DatPostProcessor(BaseProcessor):
+    TYPE = 'dat_post'
+    def process(self,postdoc,docs):
         ncols = len(docs[0]['data'][-1]['data'])
         data = [[] for i in range(ncols)]
+        push = {}
         result = {
             '$max':{'n_max':docs[-1]['n_max']},
             '$min':{'n_min':docs[0]['n_min']},
@@ -33,7 +46,7 @@ class DatPostProcessor(object):
                 'file':docs[0]['file'],
                 'name':docs[0]['name'],
                 'starttime':docs[0]['starttime'],
-            }
+            },
         }
         # the docs need to be in sorted order
         for doc in docs:
@@ -51,14 +64,16 @@ class DatPostProcessor(object):
         if head is None:
             logger.error('no head for {0}'.format(postdoc['_id']))
         else:
-            result['$push'] = push = {}
             for i,x in enumerate(head):
                 push['data.{0}'.format(x)] = {'$each':data[i]}
-        return postdoc,result
+        if len(push):
+            result['$push'] =push
+        result['$set']['modified'] =datetime.datetime.utcnow()
+        return result
 
-
-class LogPostProcessor(object):
-    def __call__(self,docs,postdoc):
+class LogPostProcessor(BaseProcessor):
+    TYPE = 'log_post'
+    def process(self,postdoc,docs):
         res = {
             'iterations':{'time':[],'initial residual':{}},
             'outer_iterations':{},
@@ -82,18 +97,18 @@ class LogPostProcessor(object):
                     if data['variable'] not in initial:
                         initial[data['variable']] = []
                     initial[data['variable']].append(data['initial residual'])
-        result['$push'] = push = {}
+        push = {}
         for x in initial:
             push['data.iterations.initial residual.{0}'.format(x)] = {'$each':initial[x]}
-        return postdoc,result
+        if len(push):
+            result['$push'] = push
+        result['$set'] = {'modified':datetime.datetime.utcnow()}
+        return result
 
-
-class FoamServerException(Exception):
-    pass
-
-
-class LogProcessor(object):
-    def __call__(self,doc):
+class LogProcessor(BaseProcessor):
+    TYPE = 'log'
+    def process(self,doc):
+        doc['processed'] = True
         for line in doc['data']:
             self.process_line(line)
         return doc
@@ -128,57 +143,58 @@ class LogProcessor(object):
                 value,unit = rest.split()
                 line['data'][key.strip()] = {'value':float(value),'unit':unit}
 
-
-class SystemProcessor(object):
-    def __call__(self,doc):
+class SystemProcessor(BaseProcessor):
+    TYPE = 'system'
+    def process(self,doc):
+        doc['processed'] = True
         return doc
 
-
-class DatProcessor(object):
-    def __call__(self,doc):
+class DatProcessor(BaseProcessor):
+    TYPE = 'dat'
+    def process(self,doc):
         path_pieces = doc['path'].split('/')
         doc['file'] = path_pieces[-1]
         doc['starttime'] = path_pieces[-2]
         doc['name'] = path_pieces[-3]
+        doc['processed'] = True
         if 'forces' in path_pieces[-1]:
-            self.process_forces(doc)
+            processor = self.process_force_line
         else:
-            self.process_scalar(doc)
+            processor = self.process_scalar_line
+        for line in doc['data']:
+            processor(line)
         return doc
 
-
-    def process_forces(self,doc):
-        for line in doc['data']:
-            n = line['n']
-            text = line['text']
-            line['data'] = res = []
-            if n == 2:
-                comment,_time,fields = text.split(' ',2)
-                res.append(_time)
-                for main_field in fields.strip().split(') '):
-                    key,minor_fields = main_field.split('(')
-                    for minor in minor_fields.split():
-                        res.append('{0}_{1}'.format(key,minor))
-            elif n > 2:
-                _time,_fields = text.strip().split('\t')
-                res.append(float(_time))
-                for main_field in _fields.split(') '):
-                    sub_res = []
-                    for x in main_field.strip('()').split():
-                        sub_res.append(float(x))
-                    res.append(sub_res)
+    def process_force_line(self,line):
+        n = line['n']
+        text = line['text']
+        line['data'] = res = []
+        if n == 2:
+            comment,_time,fields = text.split(' ',2)
+            res.append(_time)
+            for main_field in fields.strip().split(') '):
+                key,minor_fields = main_field.split('(')
+                for minor in minor_fields.split():
+                    res.append('{0}_{1}'.format(key,minor))
+        elif n > 2:
+            _time,_fields = text.strip().split('\t')
+            res.append(float(_time))
+            for main_field in _fields.split(') '):
+                sub_res = []
+                for x in main_field.strip('()').split():
+                    sub_res.append(float(x))
+                res.append(sub_res)
 
 
-    def process_scalar(self,doc):
-        for line in doc['data']:
-            n = line['n']
-            text = line['text']
-            line['data'] = res = []
-            if n == 2:
-                line['data'] = text.strip('\n# ').split('\t',2)
-            elif n > 2:
-                for x in text.strip('\n#').split('\t',2):
-                    res.append(float(x))
+    def process_scalar_line(self,line):
+        n = line['n']
+        text = line['text']
+        line['data'] = res = []
+        if n == 2:
+            line['data'] = text.strip('\n# ').split('\t',2)
+        elif n > 2:
+            for x in text.strip('\n#').split('\t',2):
+                res.append(float(x))
 
 
 class FoamServer(object):
@@ -197,10 +213,13 @@ class FoamServer(object):
             logger.setLevel(loglevel.upper())
         self.load_conf(conffile)
         self.add_logging_file_handler()
-        self.db = self.client['ventilator']
+        self.db = db = self.client['ventilator']
         self._stop = False
         self.context = zmq.Context()
         self._loop = ioloop.IOLoop.instance()
+        self._postpro_rq = collections.deque()
+        self._process_rq = collections.deque()
+        self._postpro_queue = collections.deque()
         self.processors = {
             'dat':DatProcessor(),
             'log':LogProcessor(),
@@ -211,13 +230,70 @@ class FoamServer(object):
             'log_post':LogPostProcessor(),
         }
         self.executor = ProcessPoolExecutor(max_workers=4)
-        self._results = collections.deque()
-        self._main_control_loop = ioloop.PeriodicCallback(
-            self._main_control_task,self.SLEEP_TIME*1e3,self._loop)
 
-    def _main_control_task(self):
-        for future in as_completed(self._results):
-            print(future.result()['path'])
+        self._process_control_loop = ioloop.PeriodicCallback(
+            self._process_control_task,self.SLEEP_TIME*1e3,self._loop)
+        self._process_control_loop.start()
+
+    def _update_db_and_queu(self,future):
+        _type,doc,res = future.result()
+        path = doc['_id']['path'] if _type.endswith('_post') else doc['path']
+        try:
+            ok = self.db[_type].update({'_id':doc['_id']},res)
+        except Exception as e:
+            print(traceback.format_exc())
+        else:
+            if ok['nModified']:
+                logger.info('update {0}: {1}'.format(_type,path))
+                if _type in ['dat','log']:
+                    self._postpro_queue.append(
+                        (_type,self.get_doc_id_for_post(doc)))
+            else:
+                logger.error('update {0}: {1}'.format(_type,path))
+
+    def _process_control_task(self):
+        processed = set()
+        requeu = []
+        while self._postpro_queue:
+            _type,_id = self._postpro_queue.pop()
+            _hash = hash(frozenset(_id.items()))
+            # insert into postprocessing queue
+            if not _hash in processed:
+                processed.add(_hash)
+                self.postprocess(_type,_id)
+            else:
+                # requeu the unfinished future
+                requeu.append((_type,_id))
+        for elem in requeu:
+            self._postpro_queue.append(elem)
+
+    def postprocess(self,_type,_id):
+        # test if this doc exists in post
+        colname = '{0}_post'.format(_type)
+        self.db[_type].ensure_index('n_min')
+        postdoc = self.db[colname].find_one({'_id':_id})
+        criteria = {'processed':True}
+        criteria.update(_id)
+        docs = self.db[_type].find(criteria,sort=[('n_min', 1)])
+        if docs.count() > 0:
+            # we need to completely reprocess the doc
+            if postdoc is None or docs[0]['n_min'] < postdoc['n_min']:
+                # create or reset the postdoc
+                self.db[colname].update(
+                    {'_id':_id},
+                    {'_id':_id,'n_min':1e20,'n_max':0},upsert=True)
+                docs = list(docs)
+                if postdoc is None:
+                    postdoc = self.db[colname].find_one({'_id':_id})
+            else:
+                docs = list(docs.min([('n_min',postdoc['n_max'])]))
+            # submit next processing step
+            if colname in self.post_processors and len(docs) > 0:
+                logger.debug('normal post {0} and queue docs {1}'.format(
+                    postdoc['_id']['path'],[(x['n_min'],x['n_max']) for x in docs]))
+                future = self.executor.submit(
+                        self.post_processors[colname],postdoc,docs)
+                future.add_done_callback(self._update_db_and_queu)
 
     def get_doc_id_for_post(self,doc):
         return {
@@ -228,59 +304,25 @@ class FoamServer(object):
             'host':doc['host'],
         }
 
-    def post_process_callback(self,fn):
-        doc,res = fn.result()
-        ok = self.db[doc['type']].update({'_id':doc['_id']},res)
-        logger.info(
-            'postpro done for: {0}'.format(doc['path']))
-
-    def process_callback(self,fn):
-        doc = fn.result()
-        # update the processed doc
-        self.db[doc['type']].update({'_id':doc['_id']},doc)
-        logger.info('updated doc: {0}'.format(doc['path']))
-        # test if this doc exists in post
-        _id = self.get_doc_id_for_post(doc)
-        colname = '{0}_post'.format(doc['type'])
-        postdoc = self.db[colname].find_one(_id)
-        initial_postdoc = _id.copy()
-        initial_postdoc['type'] = colname
-        initial_postdoc['n_max'] = 0
-        initial_postdoc['n_min'] = 10000
-        initial_postdoc['modified'] = datetime.datetime.utcnow()
-        # decide following processing steps
-        if doc['type'] in ['log','dat']:
-            # we need to completely reprocess the doc
-            if postdoc is None or doc['n_min'] < postdoc['n_min']:
-                self.db[colname].update(_id,initial_postdoc,upsert=True)
-                docs = list(self.db[doc['type']].find(_id,sort=[('n_min',1)]))
-                postdoc = self.db[colname].find_one(_id)
-            else:
-                docs = [doc]
-        # submit next processing step
-        if colname in self.post_processors:
-            fn = self.executor.submit(
-                self.post_processors[colname],docs,postdoc)
-            fn.add_done_callback(self.post_process_callback)
-
     def handle_msg(self,msg):
         # traverse msg
         msg_hash = hash(msg)
         doc = json.loads(msg)
-        doc['type'] = colname = doc['type']
+        colname = doc['type']
         doc['hash'] = msg_hash
+        doc['modified'] = datetime.datetime.utcnow()
         # insert the basic document
         doc['_id'] = self.db[colname].insert(doc)
         # send response to harvester
         self.server_push_socket.send_multipart(
             ['confirm',json.dumps({'hash':msg_hash})])
         # log that we saved the doc
-        logger.debug('inserted for project: {0} path: {1}'.format(
-            doc['project'],doc['path']))
+        logger.info('inserted {0}: {1}'.format(doc['type'],doc['path']))
         # submit the processing
         if colname in self.processors:
-            fn = self.executor.submit(self.processors[colname],doc)
-            fn.add_done_callback(self.process_callback)
+            #self.processors[colname](doc)
+            future = self.executor.submit(self.processors[colname],doc)
+            future.add_done_callback(self._update_db_and_queu)
 
     def load_conf(self,conffile):
         if conffile is None:
