@@ -35,6 +35,15 @@ def encode_datetime(obj):
         return {'__datetime__': True, 'as_str': obj.strftime("%Y%m%dT%H:%M:%S.%f")}
     return obj
 
+def proc_line(line,n_iter,n_sub_iter,n_orthogonality):
+    fields = line.split(',')
+    solver, rest = fields[0].split(':')
+    key = rest.split()[-1]
+    dd = (solver,float(fields[1].strip().split('=')[-1]),
+        float(fields[2].strip().split('=')[-1]),
+        int(fields[3].strip().split()[-1]),n_iter,n_sub_iter,n_orthogonality)
+    return key,dd,fields[0]
+
 class DictEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj,datetime.datetime):
@@ -269,7 +278,7 @@ class FoamPostProcessor(BaseApp):
     def start(self):
         super(FoamPostProcessor,self).start()
         logger.info("started server")
-        filename = '%s.h5'%self.name
+        filename = self.conf.get('datafile','%s.h5'%self.name)
         try:
             #self.datastore = h5py.File(
                 #filename,'r+',driver='mpio',comm=MPI.COMM_WORLD)
@@ -357,24 +366,18 @@ class FoamPostProcessor(BaseApp):
                 key, value = line.split(' = ')
                 start_time = float(value)
             if 'Solving for ' in line:
-                def proc_line(line,n):
-                    fields = line.split(',')
-                    solver, rest = fields[0].split(':')
-                    key = rest.split()[-1]
-                    dd = (solver,float(fields[1].strip().split('=')[-1]),
-                        float(fields[2].strip().split('=')[-1]),
-                        int(fields[3].strip().split()[-1]),n_iter,n_sub_iter,n)
-                    return key,dd,fields[0]
-                key,dd,start = proc_line(line,n_orthogonality)
+                key,dd,start = proc_line(
+                    line,n_iter,n_sub_iter,n_orthogonality)
                 if not key in d:
                     d[key] = []
-                d[key].append(line)
+                d[key].append(dd)
                 while len(lines):
                     if not lines[0].startswith(start):
                         n_orthogonality = 0
                         break
                     n_orthogonality += 1
-                    key,dd,start = proc_line(lines.pop(0),n_orthogonality)
+                    key,dd,start = proc_line(
+                        lines.pop(0),n_iter,n_sub_iter,n_orthogonality)
                     d[key].append(dd)
             elif line.startswith('Courant Number mean:'):
                 fields = line.split(': ')
