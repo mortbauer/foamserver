@@ -24,7 +24,7 @@ setup(
     platforms='any',
     entry_points = {
         'console_scripts' :[
-            'foamserver_server = foamserver.server:main',
+            'foamserver_server = foamserver.server:run',
             'foamserver_harvester = foamserver.harvester:run',
         ]},
     )

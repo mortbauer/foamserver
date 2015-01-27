@@ -1,27 +1,47 @@
 import os
 import sys
 import zmq
-import time
 import json
+import time
 import yaml
+import h5py
 import click
+import numpy
+import redis
+import gevent
 import signal
 import logging
-import pymongo
-import tornado
-import threading
 import datetime
 import traceback
 import collections
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from zmq.eventloop import ioloop, zmqstream
+import gevent.select
+from mpi4py import MPI
+from msgpack import dumps, loads
 
+#fmt = '%(message)s'
 fmt = '%(asctime)s - %(levelname)s - %(message)s'
 logging.basicConfig(level=logging.ERROR,format=fmt)
 logger = logging.getLogger('foamserver_server')
 logger.setLevel(logging.INFO)
 fm = logging.Formatter(fmt)
+
+def decode_datetime(obj):
+    if b'__datetime__' in obj:
+        obj = datetime.datetime.strptime(obj["__datetime__"], "%Y%m%dT%H:%M:%S.%f")
+    return obj
+
+def encode_datetime(obj):
+    if isinstance(obj, datetime.datetime):
+        return {'__datetime__': True, 'as_str': obj.strftime("%Y%m%dT%H:%M:%S.%f")}
+    return obj
+
+class DictEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj,datetime.datetime):
+            return obj.strftime("%Y-%m-%dT%H:%M:%S")
+        else:
+            return json.JSONEncoder.default(self, obj)
+
 
 class FoamServerException(Exception):
     pass
@@ -32,44 +52,6 @@ class BaseProcessor(object):
             return self.TYPE, doc, self.process(doc,*args)
         except Exception as e:
             print(traceback.format_exc())
-
-class DatPostProcessor(BaseProcessor):
-    TYPE = 'dat_post'
-    def process(self,postdoc,docs):
-        ncols = len(docs[0]['data'][-1]['data'])
-        data = [[] for i in range(ncols)]
-        push = {}
-        result = {
-            '$max':{'n_max':docs[-1]['n_max']},
-            '$min':{'n_min':docs[0]['n_min']},
-            '$set':{
-                'file':docs[0]['file'],
-                'name':docs[0]['name'],
-                'starttime':docs[0]['starttime'],
-            },
-        }
-        # the docs need to be in sorted order
-        for doc in docs:
-            # the lines in the docs are anyways in sorted order
-            for line in doc['data']:
-                if line['n'] <2:
-                    continue
-                elif line['n'] == 2:
-                    result['$set']['head'] = head = line['data']
-                else:
-                    for i in range(ncols):
-                        data[i].append(line['data'][i])
-
-        head = postdoc.get('head',result['$set'].get('head'))
-        if head is None:
-            logger.error('no head for {0}'.format(postdoc['_id']))
-        else:
-            for i,x in enumerate(head):
-                push['data.{0}'.format(x)] = {'$each':data[i]}
-        if len(push):
-            result['$push'] =push
-        result['$set']['modified'] =datetime.datetime.utcnow()
-        return result
 
 class LogPostProcessor(BaseProcessor):
     TYPE = 'log_post'
@@ -149,256 +131,480 @@ class SystemProcessor(BaseProcessor):
         doc['processed'] = True
         return doc
 
-class DatProcessor(BaseProcessor):
-    TYPE = 'dat'
-    def process(self,doc):
-        path_pieces = doc['path'].split('/')
-        doc['file'] = path_pieces[-1]
-        doc['starttime'] = path_pieces[-2]
-        doc['name'] = path_pieces[-3]
-        doc['processed'] = True
-        if 'forces' in path_pieces[-1]:
-            processor = self.process_force_line
-        else:
-            processor = self.process_scalar_line
-        for line in doc['data']:
-            processor(line)
-        return doc
-
-    def process_force_line(self,line):
-        n = line['n']
-        text = line['text']
-        line['data'] = res = []
-        if n == 2:
-            comment,_time,fields = text.split(' ',2)
-            res.append(_time)
-            for main_field in fields.strip().split(') '):
-                key,minor_fields = main_field.split('(')
-                for minor in minor_fields.split():
-                    res.append('{0}_{1}'.format(key,minor))
-        elif n > 2:
-            _time,_fields = text.strip().split('\t')
-            res.append(float(_time))
-            for main_field in _fields.split(') '):
-                sub_res = []
-                for x in main_field.strip('()').split():
-                    sub_res.append(float(x))
-                res.append(sub_res)
-
-
-    def process_scalar_line(self,line):
-        n = line['n']
-        text = line['text']
-        line['data'] = res = []
-        if n == 2:
-            line['data'] = text.strip('\n# ').split('\t',2)
-        elif n > 2:
-            for x in text.strip('\n#').split('\t',2):
-                res.append(float(x))
-
-
-class FoamServer(object):
-    SERVER_PUSH_PORT = 5051
-    SERVER_PULL_PORT = 5052
-    SLEEP_TIME = 3
+class BaseApp(object):
+    NAME = ''
+    CONF = {}
 
     def __init__(self,conffile=None,debug=False,loglevel='error'):
-        try:
-            self.client = pymongo.MongoClient('localhost',27017)
-        except pymongo.errors.ConnectionFailure:
-            raise FoamServerException('couldn\'t connect to mongodb on localhost:27017')
+        self._shutdown = False
+        self.redis = redis.StrictRedis()
         if debug:
             logger.setLevel(logging.DEBUG)
         else:
             logger.setLevel(loglevel.upper())
         self.load_conf(conffile)
         self.add_logging_file_handler()
-        self.db = db = self.client['ventilator']
-        self._stop = False
-        self.context = zmq.Context()
-        self._loop = ioloop.IOLoop.instance()
-        self._postpro_rq = collections.deque()
-        self._process_rq = collections.deque()
-        self._postpro_queue = collections.deque()
-        self.processors = {
-            'dat':DatProcessor(),
-            'log':LogProcessor(),
-            'system':SystemProcessor(),
-        }
-        self.post_processors = {
-            'dat_post':DatPostProcessor(),
-            'log_post':LogPostProcessor(),
-        }
-        self.executor = ProcessPoolExecutor(max_workers=4)
+        self.raw_queue = 'foamserver_raw_queue'
 
-        self._process_control_loop = ioloop.PeriodicCallback(
-            self._process_control_task,self.SLEEP_TIME*1e3,self._loop)
-        self._process_control_loop.start()
+    @property
+    def name(self):
+        return 'foamserver_{0}'.format(self.NAME)
 
-    def _update_db_and_queu(self,future):
-        _type,doc,res = future.result()
-        path = doc['_id']['path'] if _type.endswith('_post') else doc['path']
-        try:
-            ok = self.db[_type].update({'_id':doc['_id']},res)
-        except Exception as e:
-            print(traceback.format_exc())
-        else:
-            if ok['nModified']:
-                logger.info('update {0}: {1}'.format(_type,path))
-                if _type in ['dat','log']:
-                    self._postpro_queue.append(
-                        (_type,self.get_doc_id_for_post(doc)))
-            else:
-                logger.error('update {0}: {1}'.format(_type,path))
+    def make_redis_name(self,name):
+        return 'foamserver_{0}_{1}'.format(self.NAME,name)
 
-    def _process_control_task(self):
-        processed = set()
-        requeu = []
-        while self._postpro_queue:
-            _type,_id = self._postpro_queue.pop()
-            _hash = hash(frozenset(_id.items()))
-            # insert into postprocessing queue
-            if not _hash in processed:
-                processed.add(_hash)
-                self.postprocess(_type,_id)
-            else:
-                # requeu the unfinished future
-                requeu.append((_type,_id))
-        for elem in requeu:
-            self._postpro_queue.append(elem)
-
-    def postprocess(self,_type,_id):
-        # test if this doc exists in post
-        colname = '{0}_post'.format(_type)
-        self.db[_type].ensure_index('n_min')
-        postdoc = self.db[colname].find_one({'_id':_id})
-        criteria = {'processed':True}
-        criteria.update(_id)
-        docs = self.db[_type].find(criteria,sort=[('n_min', 1)])
-        if docs.count() > 0:
-            # we need to completely reprocess the doc
-            if postdoc is None or docs[0]['n_min'] < postdoc['n_min']:
-                # create or reset the postdoc
-                self.db[colname].update(
-                    {'_id':_id},
-                    {'_id':_id,'n_min':1e20,'n_max':0},upsert=True)
-                docs = list(docs)
-                if postdoc is None:
-                    postdoc = self.db[colname].find_one({'_id':_id})
-            else:
-                docs = list(docs.min([('n_min',postdoc['n_max'])]))
-            # submit next processing step
-            if colname in self.post_processors and len(docs) > 0:
-                logger.debug('normal post {0} and queue docs {1}'.format(
-                    postdoc['_id']['path'],[(x['n_min'],x['n_max']) for x in docs]))
-                future = self.executor.submit(
-                        self.post_processors[colname],postdoc,docs)
-                future.add_done_callback(self._update_db_and_queu)
-
-    def get_doc_id_for_post(self,doc):
-        return {
-            'project':doc['project'],
-            'path':doc['path'],
-            'root_path':doc['root_path'],
-            'initial':doc['initial'],
-            'host':doc['host'],
-        }
-
-    def handle_msg(self,msg):
-        # traverse msg
-        msg_hash = hash(msg)
-        doc = json.loads(msg)
-        colname = doc['type']
-        doc['hash'] = msg_hash
-        doc['modified'] = datetime.datetime.utcnow()
-        # insert the basic document
-        doc['_id'] = self.db[colname].insert(doc)
-        # send response to harvester
-        self.server_push_socket.send_multipart(
-            ['confirm',json.dumps({'hash':msg_hash})])
-        # log that we saved the doc
-        logger.info('inserted {0}: {1}'.format(doc['type'],doc['path']))
-        # submit the processing
-        if colname in self.processors:
-            #self.processors[colname](doc)
-            future = self.executor.submit(self.processors[colname],doc)
-            future.add_done_callback(self._update_db_and_queu)
-
-    def load_conf(self,conffile):
-        if conffile is None:
-            if 'XDG_CONFIG_HOME' in os.environ:
-                confdir = os.path.join(os.environ['XDG_CONFIG_HOME'],'foamserver')
-            else:
-                confdir = os.path.join(os.environ['HOME'],'.foamserver')
-            conffile = os.path.join(confdir,'server.yaml')
-            try:
-                os.makedirs(confdir)
-            except:
-                pass
-        else:
-            confdir = None
-        if not os.path.isfile(conffile):
-            with open(conffile,'w') as f:
-                if confdir is not None:
-                    f.write('confdir: {0}\n'.format(confdir))
-                    f.write('logfile: {0}\n'.format(os.path.join(confdir,'server.log')))
-
-        with open(conffile,'r') as f:
-            self.conf = yaml.load(f.read())
-        if 'logfile' in self.conf:
-            self.logfile = self.conf['logfile']
-        elif 'confdir' in self.conf:
-            self.logfile = os.path.join(self.conf['confdir'],'server.log')
-        elif confdir:
-            self.logfile = os.path.join(confdir,'server.log')
-        else:
-            self.logfile = os.path.join(os.environ['HOME'],'.foamserver_server.log')
-
-    def handle_response(self,msg):
-        if msg[0] == 'new_msg':
-            self.handle_msg(msg[1])
-
-    def connect(self):
-        self.server_push_socket = self.context.socket(zmq.PUSH)
-        self.server_push_socket.bind("tcp://*:{0}".format(self.SERVER_PUSH_PORT))
-        self.server_pull_socket = self.context.socket(zmq.PULL)
-        self.server_pull_socket.bind("tcp://*:{0}".format(self.SERVER_PULL_PORT))
-        self.stream = zmqstream.ZMQStream(self.server_pull_socket, self._loop)
-        self.stream.on_recv(self.handle_response)
-
-    def teardown(self):
-        self.server_pull_socket.close(linger=0)
-        self.server_push_socket.close(linger=0)
-        self.client.close()
-        self.context.term()
 
     def start(self):
-        self.connect()
-        logger.info("started server")
-        #self._main_control_loop.start()
-        self._loop.start()
-        self.executor.shutdown(wait=True)
+        signal.signal(signal.SIGINT, self.interrupt_handler)
 
-    def interrupt_handler(self,signum,frame):
-        if multiprocessing.current_process().name == 'MainProcess':
-            print('catched interrupt, shutting down')
-            self._loop.stop()
+    def load_conf(self,confdir):
+        if confdir is None:
+            if 'XDG_CONFIG_HOME' in os.environ:
+                confdir = os.path.join(
+                    os.environ['XDG_CONFIG_HOME'],'foamserver')
+            else:
+                confdir = os.path.join(os.environ['HOME'],'.foamserver')
+        conffile = os.path.join(confdir,'%s.yaml'%self.NAME)
+        try:
+            os.makedirs(confdir)
+        except:
+            pass
+        if not os.path.isfile(conffile):
+            with open(conffile,'w') as f:
+                f.write(yaml.dump(self.CONF))
+        with open(conffile,'r') as f:
+            self.conf = yaml.load(f.read())
+        if self.conf is None:
+            self.conf= {}
 
     def add_logging_file_handler(self):
-        fh = logging.FileHandler(self.logfile)
-        fh.setLevel(logging.INFO)
-        fh.setFormatter(fm)
-        logger.addHandler(fh)
+        logfile = self.conf.get('logfile')
+        if logfile:
+            fh = logging.FileHandler(logfile)
+            fh.setLevel(logging.INFO)
+            fh.setFormatter(fm)
+            logger.addHandler(fh)
 
 
-@click.command()
+    def interrupt_handler(self,signum,frame):
+        print('catched interrupt, shutting down')
+        self._shutdown = True
+
+class FoamPostProcessor(BaseApp):
+    NAME = 'postpro'
+    CONF = {
+        'datafile':'foamserver_data.h5',
+    }
+    doc = collections.namedtuple(
+        'doc',['host','project','uuid','type','path','initially'])
+
+    var_row = [
+        ('Solver','S12'),('Initial','f8'),('Final','f8'),('n_iter','i4'),
+        ('Iteration','i8'),('SubIteration','i8'),('OrthogonalityCorrector','i8')]
+
+    tsce_row = [
+        ('sum local','f8'),('global','f8'),('cumulative','f8'),
+        ('Iteration','i8'),('SubIteration','i8')]
+
+    main_row = [
+        ('Time','f8'),('ExecutionTime','f8'),('ClockTime','f8'),
+        ('Convergence','S40'),('deltaT','f8'),('CFL_mean','f8'),
+        ('CFL_max','f8')]
+
+    reread_row = [('Iteration','i8'),('Name','S20'),('Path','S150')]
+
+    def __init__(self,**kwargs):
+        super(FoamPostProcessor,self).__init__(**kwargs)
+        self.currently_processing = self.make_redis_name('currently_processing')
+
+    def process_loop(self):
+        while not self._shutdown:
+            d_id = self.redis.lpop(self.raw_queue)
+            if d_id is None:
+                gevent.sleep(1.)
+            else:
+                if self.redis.sadd(self.currently_processing,d_id):
+                    self.process_doc(d_id)
+                    self.redis.srem(self.currently_processing,d_id)
+
+    def process_doc(self,d_id):
+        d = self.doc(*d_id[5:].split('::'))
+        h5_id = d_id[5:].replace('::','/')
+        processor = getattr(self,'process_%s'%d.type)
+        #print('poping of %s'%d_id)
+        if not h5_id in self.datastore:
+            group = self.datastore.create_group(h5_id)
+            # create also a shortcut to the new data
+            # project wide
+            latest = '/'.join((d.host,d.project,'latest'))
+            if latest in self.datastore:
+                del self.datastore[latest]
+            self.datastore[latest] = self.datastore['/'.join((d.host,d.project,d.uuid))]
+            # doc wide
+            latest = '/'.join((group.parent.name,'latest'))
+            if latest in self.datastore:
+                del self.datastore[latest]
+            self.datastore[latest] = self.datastore[group.name]
+        else:
+            group = self.datastore[h5_id]
+        msgs_id = '::'.join((d_id,'msgs'))
+        while not self._shutdown:
+            n = self.redis.hget(d_id,'next')
+            if n is None:
+                n = 0
+            msg = self.redis.hget(msgs_id,n)
+            if not msg:
+                break
+            else:
+                meta,payload_msg = loads(msg)
+                payload = loads(payload_msg)
+                group = self.datastore[h5_id]
+                t0 = time.time()
+                processor(group,d_id,meta,payload)
+                self.redis.hincrby(d_id,'next')
+                logger.debug('processed %s::%s in %s sec',d_id,n,time.time()-t0)
+                self.redis.hdel(d_id,n)
+                self.datastore.flush()
+
+    def start(self):
+        super(FoamPostProcessor,self).start()
+        logger.info("started server")
+        filename = '%s.h5'%self.name
+        try:
+            #self.datastore = h5py.File(
+                #filename,'r+',driver='mpio',comm=MPI.COMM_WORLD)
+            self.datastore = h5py.File(filename,'r+')
+        except IOError:
+            #self.datastore = h5py.File(
+                #filename,'w',driver='mpio',comm=MPI.COMM_WORLD)
+            self.datastore = h5py.File(filename,'w')
+            logger.debug('creating file "%s"',filename)
+        #gevent.joinall(
+            #gevent.spawn(self.process_loop),
+        #])
+        #self.datastore.atomic = True
+        self.process_loop()
+        self.datastore.close()
+
+    def process_log(self,group,d_id,meta,lines):
+        self.redis.hsetnx(d_id,'n_runs',0)
+        self.redis.hsetnx(d_id,'n_iter',0)
+        self.redis.hsetnx(d_id,'n_sub_iter',0)
+        self.redis.hsetnx(d_id,'n_orthogonality',0)
+        self.redis.hsetnx(d_id,'start_time',0)
+        self.redis.hsetnx(d_id,'executable','')
+        self.redis.hsetnx(d_id,'cfl_mean',0)
+        self.redis.hsetnx(d_id,'cfl_max',0)
+        self.redis.hsetnx(d_id,'deltaT',0)
+        n_runs = self.redis.hget(d_id,'n_runs')
+        executable = self.redis.hget(d_id,'executable')
+        while len(lines):
+            if lines[0].startswith('Build  :'):
+                if 'run%s'%n_runs not in group:
+                    sg = group.create_group('run%s'%n_runs)
+                else:
+                    sg = group['run%s'%n_runs]
+                executable = self.process_log_header(sg,d_id,meta,lines)
+            elif 'simple' in executable or 'pimple' in executable:
+                self.process_log_imple(group['run%s'%n_runs],d_id,meta,lines)
+                executable = self.redis.hget(d_id,'executable')
+                n_runs = self.redis.hget(d_id,'n_runs')
+            else:
+                lines.pop(0)
+                if len(executable):
+                    logger.error('unknown exec: %s',executable)
+
+    def process_log_header(self,group,d_id,meta,lines):
+        # get the executable info
+        d = {}
+        for i in range(8):
+            line = lines.pop(0)
+            key,value = line.strip().split(':',1)
+            d[key.strip()] = value.strip()
+        # get the host computers
+        if int(value) > 1:
+            key = lines.pop(0).strip(' :\n')
+            lines.pop(0)
+            lines.pop(0)
+            slaves = []
+            for i in range(int(value)-1):
+                slaves.append(lines.pop(0).strip(' \n"'))
+            lines.pop(0)
+            d[key] = slaves
+        self.redis.hset(d_id,'executable_info',dumps(d))
+        self.redis.hset(d_id,'executable',d['Exec'].lower())
+        # write the info as attrs
+        for k in d:
+            group.attrs[k] = d[k]
+        return d['Exec'].lower()
+
+    def process_log_imple(self,group,d_id,meta,lines):
+        d = {}
+        tsceinfo = []
+        maininfo = []
+        reread = []
+        n_iter = int(self.redis.hget(d_id,'n_iter'))
+        n_sub_iter = int(self.redis.hget(d_id,'n_sub_iter'))
+        n_orthogonality = int(self.redis.hget(d_id,'n_orthogonality'))
+        start_time = float(self.redis.hget(d_id,'start_time'))
+        convergence_info = self.redis.hget(d_id,'convergence_info')
+        cfl_mean = self.redis.hget(d_id,'cfl_mean')
+        cfl_max = self.redis.hget(d_id,'cfl_max')
+        deltaT = self.redis.hget(d_id,'deltaT')
+        while len(lines):
+            line = lines.pop(0).strip()
+            if line.startswith('Time ='):
+                key, value = line.split(' = ')
+                start_time = float(value)
+            if 'Solving for ' in line:
+                def proc_line(line,n):
+                    fields = line.split(',')
+                    solver, rest = fields[0].split(':')
+                    key = rest.split()[-1]
+                    dd = (solver,float(fields[1].strip().split('=')[-1]),
+                        float(fields[2].strip().split('=')[-1]),
+                        int(fields[3].strip().split()[-1]),n_iter,n_sub_iter,n)
+                    return key,dd,fields[0]
+                key,dd,start = proc_line(line,n_orthogonality)
+                if not key in d:
+                    d[key] = []
+                d[key].append(line)
+                while len(lines):
+                    if not lines[0].startswith(start):
+                        n_orthogonality = 0
+                        break
+                    n_orthogonality += 1
+                    key,dd,start = proc_line(lines.pop(0),n_orthogonality)
+                    d[key].append(dd)
+            elif line.startswith('Courant Number mean:'):
+                fields = line.split(': ')
+                cfl_mean = float(fields[1].split()[0])
+                cfl_max = float(fields[2])
+            elif line.startswith('deltaT ='):
+                deltaT = float(line.split(' = ')[1])
+            elif line.startswith('time step continuity errors'):
+                key, rest = line.split(':')
+                fields = rest.split(',')
+                tsceinfo.append((float(fields[0].split('=')[1].strip()),
+                      float(fields[1].split('=')[1].strip()),
+                      float(fields[2].split('=')[1].strip()),n_iter,n_sub_iter))
+            elif line.startswith('PIMPLE: iteration'):
+                n_sub_iter += 1
+            elif line.startswith('PIMPLE: '):
+                convergence_info = line.split(':')[1].strip()
+            elif 'Re-reading object' in line:
+                name,filepath = line[18:].split(' from file ')
+                reread.append((n_iter,name,filepath.strip('"')))
+            elif line.startswith('ExecutionTime'):
+                fields = line.split('  ')
+                maininfo.append((
+                    start_time,
+                    float(fields[0].split(' = ')[1][:-2]),
+                    float(fields[0].split(' = ')[1][:-2]),
+                    convergence_info,deltaT,cfl_mean,cfl_max,
+                ))
+                n_sub_iter = 0
+            elif line.startswith('End'):
+                self.redis.hset(d_id,'executable','')
+                self.redis.hincrby(d_id,'n_runs')
+                n_iter = 0
+                n_sub_iter = 0
+                break
+
+        # update the generic keys
+        for key in d:
+            n = len(d[key])
+            if not key in group:
+                ds = group.create_dataset(
+                    key,dtype=self.var_row,shape=(n,),
+                    chunks=True,maxshape=(None,))
+            else:
+                ds = group[key]
+                ds.resize((ds.shape[0]+n,))
+            ds[-n:] = d[key]
+        # update tsce and main
+        for key,dtype,val in (
+            ('MainInfo',self.main_row,maininfo),
+            ('ReRead',self.reread_row,reread),
+            ('TSCE',self.tsce_row,tsceinfo)):
+            n = len(val)
+            if n > 0:
+                if not key in group:
+                    ds = group.create_dataset(
+                        key,(n,),dtype,chunks=True,maxshape=(None,))
+                else:
+                    ds = group[key]
+                    ds.resize((ds.shape[0]+n,))
+                ds[-n:] = val
+
+        # save the state
+        self.redis.hset(d_id,'n_iter',n_iter)
+        self.redis.hset(d_id,'n_sub_iter',n_sub_iter)
+        self.redis.hset(d_id,'n_orthogonality',n_orthogonality)
+        self.redis.hset(d_id,'start_time',start_time)
+        self.redis.hset(d_id,'convergence_info',convergence_info)
+        self.redis.hset(d_id,'cfl_mean',cfl_mean)
+        self.redis.hset(d_id,'cfl_max',cfl_max)
+        self.redis.hset(d_id,'deltaT',deltaT)
+
+
+    def process_system(self,group,d_id,meta,lines):
+        pass
+
+    def process_dat(self,group,d_id,meta,lines):
+        header,ndim = self.process_dat_collective(group,d_id,meta,lines)
+        # create temporary numpy arrays since the are much faster then hdf5
+        # access
+        n_curr_msg = self.redis.hget(d_id,'n_curr')
+        n_curr = 0 if n_curr_msg is None else int(n_curr_msg)
+        size = meta['n_max']-n_curr-2
+        shape = (size,) if ndim == 1 else (size,3)
+        timeset = numpy.empty((size,))
+        cols = [numpy.empty(shape) for x in header]
+        if ndim == 2:
+            for i,line in enumerate(lines):
+                time,fields = line.strip().split('\t')
+                timeset[i] = float(time)
+                for j,main_field in enumerate(fields.split(') ')):
+                    for k,x in enumerate(main_field.strip('()').split()):
+                        cols[j][i,k] = float(x)
+        else:
+            for i,line in enumerate(lines):
+                fields = line.strip('\n#').split('\t',2)
+                timeset[i] = float(fields[0])
+                for j,x in enumerate(fields[1:]):
+                    cols[j][i] = float(x)
+        self.redis.hincrby(d_id,'n_curr',i+1)
+        # transfer the data from our temporary numpy arrays to hdf5
+        for i,x in enumerate(header):
+            group[x][-size:] = cols[i]
+        group['Time'][-size:] = timeset
+
+    def process_dat_collective(self,group,d_id,meta,lines):
+        # take the header from redis if there is
+        header_msg = self.redis.hget(d_id,'header')
+        if header_msg is None:
+            header,ndim = self.process_dat_header(lines)
+            self.redis.hset(d_id,'header',dumps(header))
+            self.redis.hset(d_id,'ndim',ndim)
+        else:
+            header = loads(header_msg)
+            ndim = int(self.redis.hget(d_id,'ndim'))
+        # create the groups/dataset in the hdf5 if not there otherwise resize
+        n_max = meta['n_max']-2
+        shape = (n_max,) if ndim == 1 else (n_max,3)
+        mshape = (None,) if ndim == 1 else (None,3)
+        for key in header:
+            if key in group:
+                group[key].resize(shape)
+            else:
+                group.create_dataset(key,shape,'f8',chunks=True,maxshape=mshape)
+        if 'Time' in group:
+            group['Time'].resize((n_max,))
+        else:
+            group.create_dataset('Time',(n_max,),'f8',chunks=True,maxshape=(None,))
+        return header,ndim
+
+    def process_dat_header(self,lines):
+        first_line = lines.pop(0)
+        second_line = lines.pop(0)
+        third_line = lines.pop(0)
+        if 'Forces' in first_line:
+            ndim = 2
+            header = []
+            comment,time,fields = third_line.split(' ',2)
+            for main_field in fields.strip().split(') '):
+                key,minor_fields = main_field.split('(')
+                for minor in minor_fields.split():
+                    header.append('/'.join((key,minor)))
+        else:
+            ndim = 1
+            header = third_line.strip('\n# ').split('\t',2)[1:]
+        return header,ndim
+
+
+class FoamServer(BaseApp):
+    SERVER_PUSH_PORT = 5051
+    SERVER_PULL_PORT = 5052
+    NAME = 'server'
+
+    def __init__(self,**kwargs):
+        super(FoamServer,self).__init__(**kwargs)
+        self._p_store = self.make_redis_name('project_store')
+        self.context = zmq.Context()
+        self.s_sock = self.context.socket(zmq.PUSH)
+        self.r_sock = self.context.socket(zmq.PULL)
+        self.msg_counter = 0
+
+    def handle_msg(self,doc_msg,payload_msg):
+        doc = loads(doc_msg)
+        d = doc['doc']
+        p = doc['project']
+        p_id = '::'.join((p['host'],p['project'],p['uuid']))
+        d_id = '::'.join(
+            (d['type'],d['path'],d['initially_tracked']))
+        f_id = '::'.join((p_id,d_id))
+        # insert the project meta data
+        if self.redis.hsetnx(self._p_store,p_id,p['root_path']):
+            logger.debug('added new project: %s',p_id)
+        # store the doc meta
+        doc_id = '::'.join(('doc',f_id))
+        if self.redis.sadd('::'.join(('project',p_id)),d_id):
+            logger.debug('added new doc: %s to %s',d_id,p_id)
+        # append the msg to the doc
+        self.redis.hset('::'.join((doc_id,'msgs')),d['msg_number'],dumps((d,payload_msg)))
+        # push the msg id to the raw_queue
+        self.redis.rpush(self.raw_queue,doc_id)
+        # send response
+        self.s_sock.send_multipart(
+            ['confirm',doc_msg,dumps(hash(payload_msg))])
+
+    def receive_loop(self):
+        while not self._shutdown:
+            try:
+                msg = self.r_sock.recv_multipart(flags=zmq.NOBLOCK)
+            except zmq.ZMQError:
+                gevent.sleep(1.)
+            else:
+                if 'new' == msg[0] :
+                    self.handle_msg(msg[1],msg[2])
+                else:
+                    gevent.sleep(1.)
+
+    def connect(self):
+        self.s_sock.bind("tcp://*:%s"%self.SERVER_PUSH_PORT)
+        self.r_sock.bind("tcp://*:%s"%self.SERVER_PULL_PORT)
+
+    def start(self):
+        super(FoamServer,self).start()
+        self.connect()
+        logger.info("started server")
+        gevent.joinall([
+            gevent.spawn(self.receive_loop),
+        ])
+
+@click.group()
+def run():
+    pass
+
+@run.command()
 @click.option('--debug/--no-debug')
 @click.option('--loglevel',default='error')
-def main(debug=False,loglevel='error'):
-    try:
-        server = FoamServer(debug=debug,loglevel=loglevel)
-    except KeyboardInterrupt:
-        print('catched keyboard interrupt, quitting')
+def server(debug=False,loglevel='error'):
+    server = FoamServer(debug=debug,loglevel=loglevel)
+    server.start()
+
+@run.command()
+@click.option('--debug',is_flag=True)
+@click.option('--loglevel',default='error')
+@click.option('--profile',is_flag=True)
+def processor(debug,loglevel,profile):
+    server = FoamPostProcessor(debug=debug,loglevel=loglevel)
+    if profile:
+        import cProfile
+        import pstats
+        cProfile.runctx('server.start()',None,locals(),'restats')
+        p = pstats.Stats('restats')
+        p.strip_dirs().sort_stats('cumulative').print_stats(20)
     else:
-        signal.signal(signal.SIGINT, server.interrupt_handler)
         server.start()

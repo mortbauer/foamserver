@@ -7,19 +7,30 @@ import hashlib
 import datetime
 import logging
 import itertools
+from retask import Task
 from watchdog.events import FileSystemEventHandler, RegexMatchingEventHandler
-
 logger = logging.getLogger('harvester')
+
+class DictEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj,datetime.datetime):
+            return obj.strftime("%Y-%m-%dT%H:%M:%S")
+        elif isinstance(obj,collections.deque):
+            return list(obj)
+        else:
+            return json.JSONEncoder.default(self, obj)
+
 
 class HarvesterEventHandler(RegexMatchingEventHandler):
     __metaclass__ = abc.ABCMeta
+    MAX_LINES = 50000
 
     def __init__(self,queue,cache,regexes=None):
         super(HarvesterEventHandler,self).__init__(
             regexes=self.REGEXES if regexes is None else regexes,
             ignore_directories=True)
         self.data = cache[self.TYPE]
-        self.queue = queue
+        self._queue = queue
         self.currently_processing = set()
 
     def init(self,path,recursive):
@@ -35,6 +46,9 @@ class HarvesterEventHandler(RegexMatchingEventHandler):
 
     def on_modified(self,event):
         self.work(event.src_path)
+
+    def queue(self,doc):
+        self._queue.enqueue(Task(json.dumps(doc,cls=DictEncoder),raw=True))
 
     def work(self,path):
         if path in self.currently_processing:
@@ -85,7 +99,7 @@ class SystemEventHandler(HarvesterEventHandler):
             doc['text'] = text
             doc['hash'] = hasher.hexdigest()
         if doc['hash'] != self.data[path]['hash']:
-            self.queue.append(doc)
+            self.queue(doc)
             self.data[path]['hash'] = doc['hash']
         return True
 
@@ -112,7 +126,7 @@ class DatEventHandler(HarvesterEventHandler):
         with open(path,'r') as f:
             f.seek(d['pos'])
             data = []
-            for i in range(2000):
+            for i in range(self.MAX_LINES):
                 line = f.readline()
                 if not line:
                     break
@@ -122,7 +136,7 @@ class DatEventHandler(HarvesterEventHandler):
             d['line_number'] += len(data)
             d['pos'] = f.tell()
         if len(data) > 0:
-            self.queue.append(
+            self.queue(
                 {'path':path,
                 'type':self.TYPE,
                 'n_min':n_min,
