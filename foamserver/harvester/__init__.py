@@ -22,7 +22,7 @@ import gevent.event
 import gevent.select
 import gevent.fileobject
 import hashlib
-from msgpack import dumps, loads
+from json import dumps, loads
 import zmq.green as zmq
 import watchdog.observers
 from watchdog.observers.api import ObservedWatch
@@ -552,7 +552,16 @@ def info():
 @run.command()
 @click.argument('pattern')
 @click.option('--force',is_flag=True)
-def reset_cache(pattern,force):
+@click.option('--quiet',is_flag=True)
+@click.option('-d','--debug',default=False,is_flag=True)
+@click.option('-l','--loglevel',default='error')
+def reset_cache(pattern,force,debug,loglevel,quiet):
+    if hasattr(logging,loglevel.upper()):
+        logger.setLevel(loglevel.upper())
+    else:
+        logger.error('there is no "{0}" loglevel'.format(loglevel))
+    if debug:
+        logger.setLevel(logging.DEBUG)
     harvester = Harvester()
     PATTERN = re.compile(pattern)
     data = {}
@@ -562,18 +571,22 @@ def reset_cache(pattern,force):
             if PATTERN.match(path):
                 data[key].append(path)
     # ask
-    print('paths marked for resetting:\n')
+    if not force:
+        print('paths marked for resetting:\n')
     any_matched = False
     for key in data:
-        if len(data[key]):
+        if not force and len(data[key]):
             print('{0}:'.format(key))
         for path in data[key]:
             any_matched = True
-            print('    {0}:'.format(path))
+            if not force:
+                print('    {0}:'.format(path))
     if any_matched:
         if force or click.confirm('\nreally clear state for marked paths ?'):
             for key in data:
                 for path in data[key]:
+                    if not quiet:
+                        print('resetting state for: %s %s'%(key,path))
                     del harvester.state[key][path]
         harvester.save_state()
     else:
