@@ -237,7 +237,7 @@ class FoamPostProcessorHDF5(BaseApp):
                 gevent.sleep(1.)
             else:
                 if self.redis.sadd(self.currently_processing,d_id) and not \
-                        self.sismember(self._failed,d_id):
+                        self.redis.sismember(self._failed,d_id):
                     self.process_doc(d_id)
                     self.redis.srem(self.currently_processing,d_id)
 
