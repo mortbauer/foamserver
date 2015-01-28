@@ -309,7 +309,7 @@ class Harvester(object):
                 data = json.loads(f.read())
                 stored_version = data.get('version',0.0)
                 if stored_version < 0.2:
-                    data = convert_from(data,stored_version)
+                    raise ClickException('can\'t continue, old version detected')
                 if not 'uuid' in data:
                     logger.critical(
                         'probably corrupted: {0} no uuid'.format(self.PERSISTENCE))
