@@ -16,6 +16,7 @@ import socket
 import datetime
 import logging
 import pprint
+import cerberus
 import redis
 import gevent
 import gevent.event
@@ -40,23 +41,21 @@ INITIAL_DATA = {
     'uuid':uuid.uuid4().get_hex(),
 }
 
-INITIAL_CONFIG = {
-    'watch':{
-        'system':[{
-            'path':'system',
-            'regexes':['.*'],
-            'recursive':False,
-        }],'log':[{
-            'path':'./',
-            'regexes':['log\..*'],
-            'recursive':False,
-        }],'dat':[{
-            'path':'postProcessing',
-            'regexes':['.*\.dat'],
-            'recursive':True,
-        }]
-    }
+CONFIG_SCHEMA = {
+    'project': {'type': 'string','required':True},
+    'watch':{'type':'list','required':True,'schema':{
+        'type':'dict','schema':{
+            'type':{
+                'type':'string',
+                'required':True,
+                'allowed':['log','dat','system'],
+            },'path':{'type':'string','required':True},
+            'regexes':{'type':'list','schema':{'type':'string'}},
+            'recursive':{'type':'boolean'},
+        }
+    }}
 }
+
 
 #fmt = '%(message)s'
 fmt = '%(asctime)s - %(levelname)s - %(message)s'
@@ -233,6 +232,29 @@ class LogProcessor(DatProcessor):
     TYPE = 'log'
 
 
+INITIAL_CONFIG = {
+    'watch':[
+        {'type':'system',
+         'path':'system',
+         'recursive':False,
+         'regexes':SystemProcessor.REGEXES},
+        {'type':'log',
+         'path':'.',
+         'recursive':False,
+         'regexes':LogProcessor.REGEXES},
+        {'type':'dat',
+         'path':'postProcessing',
+         'recursive':True,
+         'regexes':DatProcessor.REGEXES},
+    ]
+}
+
+processors = {
+    'log':LogProcessor,
+    'system':SystemProcessor,
+    'dat':DatProcessor,
+}
+
 class Harvester(object):
     SLEEP_TIME = 2
     PERSISTENCE = '.harvester.json'
@@ -287,20 +309,15 @@ class Harvester(object):
             self.conf.get('pull_port',self.SERVER_PUSH_PORT)))
 
     def load_conf(self):
-        if not os.path.isfile(self.CONF):
+        v = cerberus.Validator(CONFIG_SCHEMA)
+        try:
+            with open(self.CONF,'r') as f:
+                self.conf = yaml.load(f.read())
+        except:
             raise click.ClickException(
                 'failed to load {0} which is required.'.format(self.CONF))
-        with open(self.CONF,'r') as f:
-            self.conf = yaml.load(f.read())
-        try:
-            self.meta['project'] = self.conf['project']
-        except KeyError:
-            raise click.ClickException('you need to specify a project name in the configuration')
-        try:
-            self.watch = self.conf['watch']
-            assert type(self.watch) == dict
-        except KeyError:
-            raise click.ClickException('you need to specify a project name in the configuration')
+        if not v.validate(self.conf):
+            raise click.ClickException('conf validation failed with:\n %s'%v.errors)
 
     def load_state(self):
         self.data = copy.deepcopy(INITIAL_DATA)
@@ -336,20 +353,18 @@ class Harvester(object):
             logger.critical('interrupted the save state')
 
     def init_handlers(self):
-        for _type in self.watch:
-            if _type not in self.processors:
-                logger.error('no handler of type: {0}'.format(_type))
+        for item in self.conf['watch']:
+            if item['type'] not in self.processors:
+                logger.error('no handler of type: {0}'.format(item['type']))
                 continue
-            processor = self.processors[_type]
-            for item in self.watch[_type]:
-                path = item['path']
-                recursive = item.get('recursive')
-                handler = EventHandler(
-                    self.redis,self._pqueue,_type,
-                    regexes=item.get('regexes',processor.REGEXES))
-                # fire my initialitation
-                handler.init(path,recursive)
-                self.observer.schedule(handler,path,recursive=recursive)
+            processor = self.processors[item['type']]
+            recursive = item.get('recursive')
+            handler = EventHandler(
+                self.redis,self._pqueue,item['type'],
+                regexes=item.get('regexes',processor.REGEXES))
+            # fire my initialitation
+            handler.init(item['path'],recursive)
+            self.observer.schedule(handler,item['path'],recursive=recursive)
 
     def resend(self):
         i = 0
@@ -606,4 +621,44 @@ def init(project,force,directory):
         config['project'] = project
         with open(filepath,'w') as f:
             yaml.dump(config,f)
+
+@run.command()
+@click.option('-d','--directory',default='.')
+@click.argument('path',nargs=-1,required=True)
+@click.option('--type',nargs=1,required=True,type=click.Choice(['log','dat','system']))
+@click.option('--regexes')
+@click.option('--recursive',is_flag=True)
+def add_to_watch(path,type,directory,regexes,recursive):
+    filepath = os.path.join(directory,Harvester.CONF)
+    with open(filepath,'r') as f:
+        d = yaml.load(f)
+    for p in path:
+        d['watch'].append({
+            'type':type,
+            'regexes':regexes if regexes else processors[type].REGEXES,
+            'recursive':recursive,
+            'path':p
+        })
+    with open(filepath,'w') as f:
+        yaml.dump(d,f)
+
+
+
+@run.command()
+@click.option('-d','--directory',default='.')
+def convert_config(directory):
+    filepath = os.path.join(directory,Harvester.CONF)
+    with open(filepath,'r') as f:
+        d = yaml.load(f)
+    watch = []
+    for _type in d['watch']:
+        for item in d['watch'][_type]:
+            item['type'] = _type
+            watch.append(item)
+    d['watch'] = watch
+    with open(filepath,'w') as f:
+        yaml.dump(d,f)
+
+
+
 
