@@ -307,6 +307,14 @@ class FoamPostProcessorHDF5(BaseApp):
                 group = self.datastore[h5_id]
                 t0 = time.time()
                 try:
+                    # store into mongo
+                    d_doc = d._asdict()
+                    d_doc['n'] = n
+                    self.db.archive.insert(
+                        {'_id':d_doc,'meta':meta,'payload':payload})
+                except pymongo.errors.DuplicateKeyError:
+                    logger.debug('msg already in archive: %s',d_id)
+                try:
                     processor(group,d_id,meta,payload)
                 except Exception as e:
                     logger.critical('failed to process: %s::%s \n %s',d_id,n,e)
@@ -317,14 +325,6 @@ class FoamPostProcessorHDF5(BaseApp):
                 else:
                     self.redis.hincrby(d_id,'next')
                     logger.debug('processed %s::%s in %s sec',d_id,n,time.time()-t0)
-                    # store into mongo
-                    d_doc = d._asdict()
-                    d_doc['n'] = n
-                    try:
-                        self.db.archive.insert(
-                            {'_id':d_doc,'meta':meta,'payload':payload_msg})
-                    except pymongo.errors.DuplicateKeyError:
-                        logger.debug('msg already in archive: %s',d_id)
                     #self.redis.hdel(msgs_id,n)
                     self.datastore.flush()
 
@@ -596,7 +596,7 @@ class FoamPostProcessorHDF5(BaseApp):
             for main_field in fields.strip().split(') '):
                 key,minor_fields = main_field.split('(')
                 for minor in minor_fields.split():
-                    header.append('/'.join((key,minor)))
+                    header.append('/'.join((key,minor.strip(')'))))
         else:
             ndim = 1
             header = third_line.strip('\n# ').split('\t')[1:]
@@ -625,14 +625,15 @@ class FoamServer(BaseApp):
             (d['type'],d['path'],d['initially_tracked']))
         f_id = '::'.join((p_id,d_id))
         # insert the project meta data
-        if self.redis.hsetnx(self._p_store,p_id,p['root_path']):
+        if self.redis.hsetnx(self._p_store,p_id,dumps(p)):
             logger.debug('added new project: %s',p_id)
         # store the doc meta
         doc_id = '::'.join(('doc',f_id))
         if self.redis.sadd('::'.join(('project',p_id)),d_id):
             logger.debug('added new doc: %s to %s',d_id,p_id)
         # append the msg to the doc
-        self.redis.hset('::'.join((doc_id,'msgs')),d['msg_number'],dumps((d,payload_msg)))
+        self.redis.hset(
+            '::'.join((doc_id,'msgs')),d['msg_number'],dumps((d,payload_msg)))
         # push the msg id to the raw_queue
         self.redis.rpush(self.raw_queue,doc_id)
         # send response

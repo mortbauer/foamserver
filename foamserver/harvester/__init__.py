@@ -31,16 +31,6 @@ from watchdog.events import RegexMatchingEventHandler
 
 VERSION = 0.2
 
-class HarvesterException(Exception):
-    pass
-
-INITIAL_DATA = {
-    'version':VERSION,
-    'state':{'system':{},'log':{},'dat':{}},
-    'harvester_starttime':datetime.datetime.utcnow(),
-    'uuid':uuid.uuid4().get_hex(),
-}
-
 CONFIG_SCHEMA = {
     'project': {'type': 'string','required':True},
     'watch':{'type':'list','required':True,'schema':{
@@ -68,20 +58,6 @@ fm = logging.Formatter(fmt)
 fh.setFormatter(fm)
 logger.addHandler(fh)
 
-
-def convert_from(data,version):
-    ndata = copy.deepcopy(INITIAL_DATA)
-    if version == 0.0:
-        ndata['state']['system'] = data['system']
-        ndata['state']['log'] = data['logs']
-        ndata['state']['dat'] = data['postProcessing']
-
-    return ndata
-
-def decode_datetime(obj):
-    if b'__datetime__' in obj:
-        obj = datetime.datetime.strptime(obj["__datetime__"], "%Y%m%dT%H:%M:%S.%f")
-    return obj
 
 def encode_datetime(obj):
     if isinstance(obj, datetime.datetime):
@@ -197,6 +173,7 @@ class DatProcessor(BaseProcessor):
         d = self.data[path]
         nd = lambda n_min,n_max:{
             'msg_number':d['msg_number'],
+            'timestamp':time.time(),
             'path':path,
             'n_min':n_min,
             'n_max':n_max,
@@ -320,7 +297,12 @@ class Harvester(object):
             raise click.ClickException('conf validation failed with:\n %s'%v.errors)
 
     def load_state(self):
-        self.data = copy.deepcopy(INITIAL_DATA)
+        self.data =  {
+            'version':VERSION,
+            'state':{'system':{},'log':{},'dat':{}},
+            'harvester_initial_starttime':datetime.datetime.utcnow(),
+            'uuid':uuid.uuid4().get_hex(),
+        }
         try:
             with open(self.PERSISTENCE,'r') as f:
                 data = json.loads(f.read())
@@ -339,7 +321,8 @@ class Harvester(object):
         #self.meta['harvester_starttime'] = self.data['harvester_starttime']
         self.meta['uuid'] = self.uuid
         self.meta['project'] = self.conf['project']
-        #self.meta['harvester_version'] = VERSION
+        self.meta['harvester_starttime'] = datetime.datetime.utcnow()
+        self.meta['harvester_version'] = VERSION
 
     def save_state(self):
         try:
