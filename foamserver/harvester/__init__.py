@@ -354,6 +354,9 @@ class Harvester(object):
 
     def init_handlers(self):
         for item in self.conf['watch']:
+            if not os.path.isdir(item['path']):
+                logger.error('skipping rule for path: %s, not dir',item['path'])
+                continue
             if item['type'] not in self.processors:
                 logger.error('no handler of type: {0}'.format(item['type']))
                 continue
