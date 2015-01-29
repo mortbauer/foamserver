@@ -593,15 +593,17 @@ def reset_cache(pattern,force,debug,loglevel,quiet):
         print('nothing matched.')
 
 @run.command()
+@click.option('-p','--project')
 @click.option('--force',is_flag=True)
-@click.option('--project')
-def init(project,force):
-    if not os.path.exists(Harvester.CONF) or force or \
+@click.option('-d','--directory',default='.')
+def init(project,force,directory):
+    filepath = os.path.join(directory,Harvester.CONF)
+    if not os.path.exists(filepath) or force or \
             click.confirm('harvester.yaml exists, really overwrite?'):
         if project is None:
             project = str(click.prompt('project name'))
         config = copy.deepcopy(INITIAL_CONFIG)
         config['project'] = project
-        with open(Harvester.CONF,'w') as f:
+        with open(filepath,'w') as f:
             yaml.dump(config,f)
 
