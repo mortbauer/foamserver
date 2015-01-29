@@ -664,6 +664,18 @@ def convert_config(directory):
     with open(filepath,'w') as f:
         yaml.dump(d,f)
 
+@run.command()
+@click.option('-d','--directory',default='.')
+def validate_config(directory):
+    filepath = os.path.join(directory,Harvester.CONF)
+    with open(filepath,'r') as f:
+        d = yaml.load(f)
+    v = cerberus.Validator(CONFIG_SCHEMA)
+    if not v.validate(d):
+        print('validation failed with:\n %s'%v.errors)
+
+
+
 
 
 
