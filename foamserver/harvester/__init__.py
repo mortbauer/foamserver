@@ -338,6 +338,7 @@ class Harvester(object):
         self.uuid = self.data['uuid']
         #self.meta['harvester_starttime'] = self.data['harvester_starttime']
         self.meta['uuid'] = self.uuid
+        self.meta['project'] = self.conf['project']
         #self.meta['harvester_version'] = VERSION
 
     def save_state(self):
