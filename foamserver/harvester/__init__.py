@@ -635,6 +635,8 @@ def add_to_watch(path,type,directory,regexes,recursive):
     filepath = os.path.join(directory,Harvester.CONF)
     with open(filepath,'r') as f:
         d = yaml.load(f)
+    if d['watch'] is None:
+        d['watch'] = []
     for p in path:
         d['watch'].append({
             'type':type,
