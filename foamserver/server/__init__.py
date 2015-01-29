@@ -36,13 +36,13 @@ def encode_datetime(obj):
         return {'__datetime__': True, 'as_str': obj.strftime("%Y%m%dT%H:%M:%S.%f")}
     return obj
 
-def proc_line(line,n_iter,n_outer_corr,n_corr,n_orthogonality):
+def proc_line(line,start_time,n_iter,n_outer_corr,n_corr,n_ortho):
     fields = line.split(',')
     solver, rest = fields[0].split(':')
     key = rest.split()[-1]
     dd = (solver,float(fields[1].strip().split('=')[-1]),
         float(fields[2].strip().split('=')[-1]),
-        int(fields[3].strip().split()[-1]),n_iter,n_outer_corr,n_corr,n_orthogonality)
+        int(fields[3].strip().split()[-1]),start_time,n_iter,n_outer_corr,n_corr,n_ortho)
     return key,dd,fields[0]
 
 class DictEncoder(json.JSONEncoder):
@@ -210,7 +210,7 @@ class FoamPostProcessorHDF5(BaseApp):
 
     var_row = [
         ('solver','S12'),('initial','f8'),('final','f8'),('n_lin_iter','i4'),
-        ('n_iter','i8'),('n_outer_corr','i8'),('n_corr','i8'),('n_ortho','i8')]
+        ('time','f8'),('n_iter','i8'),('n_outer_corr','i8'),('n_corr','i8'),('n_ortho','i8')]
 
     tsce_row = [
         ('sum local','f8'),('global','f8'),('cumulative','f8'),
@@ -219,7 +219,7 @@ class FoamPostProcessorHDF5(BaseApp):
     main_row = [
         ('time','f8'),('execution_time','f8'),('clock_time','f8'),
         ('convergence','S40'),('delta_t','f8'),('cfl_mean','f8'),
-        ('cfl_max','f8'),('n_iter','i8'),('n_outer_corr','i8')]
+        ('cfl_max','f8'),('n_iter','i8'),('n_outer_corr','i8'),('n_corr','i8'),('n_ortho','i8')]
 
     reread_row = [('n_iter','i8'),('name','S20'),('path','S150')]
 
@@ -241,6 +241,23 @@ class FoamPostProcessorHDF5(BaseApp):
                     self.process_doc(d_id)
                     self.redis.srem(self.currently_processing,d_id)
 
+
+    def process_recompute_loop(self,queue):
+        while not self._shutdown:
+            d_id = self.redis.spop(queue)
+            if d_id is None:
+                break
+            else:
+                if self.redis.sadd(self.currently_processing,d_id):
+                    self.redis.delete(d_id)
+                    del self.datastore[self.redisid_to_h5id(d_id)]
+                    logger.warn('deleted: %s from redis and datastore',d_id)
+                    self.process_doc(d_id)
+                    self.redis.srem(self.currently_processing,d_id)
+
+    @staticmethod
+    def redisid_to_h5id(redis_id):
+        return redis_id[5:].replace('::','/')
 
     def process_failed_loop(self,failed=''):
         while not self._shutdown:
@@ -292,9 +309,10 @@ class FoamPostProcessorHDF5(BaseApp):
                 try:
                     processor(group,d_id,meta,payload)
                 except Exception as e:
-                    logger.critical('failed to process: %s::%s',d_id,n)
+                    logger.critical('failed to process: %s::%s \n %s',d_id,n,e)
+                    print(traceback.format_exc())
                     n_failed = self.redis.hincrby(d_id,'failed')
-                    self.redis.sadd('::'.join((self._failed,n_failed)),d_id)
+                    self.redis.sadd('::'.join((self._failed,str(n_failed))),d_id)
                     break
                 else:
                     self.redis.hincrby(d_id,'next')
@@ -302,12 +320,15 @@ class FoamPostProcessorHDF5(BaseApp):
                     # store into mongo
                     d_doc = d._asdict()
                     d_doc['n'] = n
-                    self.db.archive.insert(
-                        {'_id':d_doc,'meta':meta,'payload':payload_msg})
-                    self.redis.hdel(msgs_id,n)
+                    try:
+                        self.db.archive.insert(
+                            {'_id':d_doc,'meta':meta,'payload':payload_msg})
+                    except pymongo.errors.DuplicateKeyError:
+                        logger.debug('msg already in archive: %s',d_id)
+                    #self.redis.hdel(msgs_id,n)
                     self.datastore.flush()
 
-    def start(self,failed=0):
+    def start(self,failed=None,reprocess=None):
         super(FoamPostProcessorHDF5,self).start()
         logger.info("started server")
         filename = self.conf.get('datafile','%s.h5'%self.name)
@@ -324,10 +345,12 @@ class FoamPostProcessorHDF5(BaseApp):
             #gevent.spawn(self.process_loop),
         #])
         #self.datastore.atomic = True
-        if failed is None:
-            self.process_loop()
-        else:
+        if failed is not None:
             self.process_failed_loop(failed)
+        elif reprocess is not None:
+            self.process_recompute_loop(reprocess)
+        else:
+            self.process_loop()
         self.datastore.close()
 
     def process_log(self,group,d_id,meta,lines):
@@ -335,7 +358,9 @@ class FoamPostProcessorHDF5(BaseApp):
         self.redis.hsetnx(d_id,'n_iter',0)
         self.redis.hsetnx(d_id,'n_outer_corr',0)
         self.redis.hsetnx(d_id,'n_corr',0)
-        self.redis.hsetnx(d_id,'n_orthogonality',0)
+        self.redis.hsetnx(d_id,'n_ortho',0)
+        self.redis.hsetnx(d_id,'n_corr_max',0)
+        self.redis.hsetnx(d_id,'n_ortho_max',0)
         self.redis.hsetnx(d_id,'start_time',0)
         self.redis.hsetnx(d_id,'executable','')
         self.redis.hsetnx(d_id,'cfl_mean',0)
@@ -391,30 +416,32 @@ class FoamPostProcessorHDF5(BaseApp):
         n_iter = int(self.redis.hget(d_id,'n_iter'))
         n_outer_corr = int(self.redis.hget(d_id,'n_outer_corr'))
         n_corr = int(self.redis.hget(d_id,'n_corr'))
-        n_orthogonality = int(self.redis.hget(d_id,'n_orthogonality'))
+        n_corr_max = int(self.redis.hget(d_id,'n_corr_max'))
+        n_ortho = int(self.redis.hget(d_id,'n_ortho'))
+        n_ortho_max = int(self.redis.hget(d_id,'n_ortho_max'))
         start_time = float(self.redis.hget(d_id,'start_time'))
         convergence_info = self.redis.hget(d_id,'convergence_info')
-        cfl_mean = self.redis.hget(d_id,'cfl_mean')
-        cfl_max = self.redis.hget(d_id,'cfl_max')
-        deltaT = self.redis.hget(d_id,'deltaT')
+        cfl_mean = float(self.redis.hget(d_id,'cfl_mean'))
+        cfl_max = float(self.redis.hget(d_id,'cfl_max'))
+        deltaT =float( self.redis.hget(d_id,'deltaT'))
         while len(lines):
             line = lines.pop(0).strip()
             if line.startswith('Time ='):
                 key, value = line.split(' = ')
                 start_time = float(value)
             if 'Solving for ' in line:
-                n_orthogonality = 0
+                n_ortho = 0
                 key,dd,start = proc_line(
-                    line,n_iter,n_outer_corr,n_corr,n_orthogonality)
+                    line,start_time,n_iter,n_outer_corr,n_corr,n_ortho)
                 if not key in d:
                     d[key] = []
                 d[key].append(dd)
                 while len(lines):
                     if not lines[0].startswith(start):
                         break
-                    n_orthogonality += 1
+                    n_ortho += 1
                     key,dd,start = proc_line(
-                        lines.pop(0),n_iter,n_outer_corr,n_corr,n_orthogonality)
+                        lines.pop(0),start_time,n_iter,n_outer_corr,n_corr,n_ortho)
                     d[key].append(dd)
             elif line.startswith('Courant Number mean:'):
                 fields = line.split(': ')
@@ -424,13 +451,15 @@ class FoamPostProcessorHDF5(BaseApp):
                 deltaT = float(line.split(' = ')[1])
             elif line.startswith('time step continuity errors'):
                 n_corr +=1
-                n_orthogonality = 0
+                n_ortho_max = n_ortho
+                n_ortho = 0
                 key, rest = line.split(':')
                 fields = rest.split(',')
                 tsceinfo.append((float(fields[0].split('=')[1].strip()),
                       float(fields[1].split('=')[1].strip()),
                       float(fields[2].split('=')[1].strip()),n_iter,n_outer_corr,n_corr))
             elif line.startswith('PIMPLE: iteration'):
+                n_corr_max = n_corr
                 n_corr = 0
                 n_outer_corr += 1
             elif line.startswith('PIMPLE: '):
@@ -445,7 +474,10 @@ class FoamPostProcessorHDF5(BaseApp):
                     float(fields[0].split(' = ')[1][:-2]),
                     float(fields[0].split(' = ')[1][:-2]),
                     convergence_info,deltaT,cfl_mean,cfl_max,n_iter,n_outer_corr,
+                    n_corr_max,n_ortho_max
                 ))
+                n_corr_max = 0
+                n_ortho_max = 0
                 n_outer_corr = 0
                 n_iter +=1
             elif line.startswith('End'):
@@ -483,8 +515,12 @@ class FoamPostProcessorHDF5(BaseApp):
 
         # save the state
         self.redis.hset(d_id,'n_iter',n_iter)
+        self.redis.hset(d_id,'n_corr',n_corr)
+        self.redis.hset(d_id,'n_corr_max',n_corr_max)
         self.redis.hset(d_id,'n_outer_corr',n_outer_corr)
-        self.redis.hset(d_id,'n_orthogonality',n_orthogonality)
+        self.redis.hset(d_id,'n_ortho',n_ortho)
+        self.redis.hset(d_id,'n_ortho_max',n_ortho_max)
+        self.redis.hset(d_id,'n_corr',n_corr)
         self.redis.hset(d_id,'start_time',start_time)
         self.redis.hset(d_id,'convergence_info',convergence_info)
         self.redis.hset(d_id,'cfl_mean',cfl_mean)
@@ -639,17 +675,25 @@ def server(debug=False,loglevel='error'):
     server.start()
 
 @run.command()
+@click.option('--failed')
+@click.option('--reprocess')
 @click.option('--debug',is_flag=True)
 @click.option('--loglevel',default='error')
 @click.option('--profile',is_flag=True)
-@click.option('--failed')
-def processor(debug,loglevel,profile,failed):
+def processor(debug,loglevel,profile,failed,reprocess):
     server = FoamPostProcessorHDF5(debug=debug,loglevel=loglevel)
     if profile:
         import cProfile
         import pstats
-        cProfile.runctx('server.start(failed=%s)'%failed,None,locals(),'restats')
+        cProfile.runctx('server.start()',None,locals(),'restats')
         p = pstats.Stats('restats')
         p.strip_dirs().sort_stats('cumulative').print_stats(20)
     else:
-        server.start(failed=failed)
+        server.start(failed=failed,reprocess=reprocess)
+
+def from_mongo_to_redis():
+    for x in db.archive.find({'_id.host':'b200','_id.type':'log'}):
+        d = x['_id']
+        msg = json.dumps((x['meta'],x['payload']))
+        _id = '::'.join(('doc',d['host'],d['project'],d['uuid'],d['type'],d['path'],d['initially'],'msgs'))
+        r.hset(_id,d['n'],msg)
