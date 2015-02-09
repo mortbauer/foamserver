@@ -6,12 +6,9 @@ differ = FoamDictDiffer()
 
 def parse_doc(doc):
     try:
-        return FoamFileParser(doc['data']['text']).data
+        return FoamFileParser(doc['payload']).data
     except:
-        try:
-            return FoamStringParser(doc['data']['text']).data
-        except:
-            raise Exception('can\'t parse {0}'.format(doc['path']))
+        return FoamStringParser(doc['payload']).data
 
 def diffs_for_docs(docs):
     diffs = {}
@@ -19,9 +16,11 @@ def diffs_for_docs(docs):
     for doc in docs[1:]:
         d = parse_doc(doc)
         try:
-            diffs[doc['data']['timestamp']] = list(differ.diff(d0,d))
+            diff = list(differ.diff(d0,d))
+            if len(diff) >0:
+                diffs[doc['meta']['timestamp']] = diff
         except KeyError:
-            print('no timestamp for {0}'.format(doc['path']))
+            print('no timestamp for {0}'.format(doc['_id']['path']))
         d0 = d
     return diffs
 
