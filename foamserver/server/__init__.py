@@ -26,16 +26,6 @@ logger = logging.getLogger('foamserver_server')
 logger.setLevel(logging.INFO)
 fm = logging.Formatter(fmt)
 
-def decode_datetime(obj):
-    if b'__datetime__' in obj:
-        obj = datetime.datetime.strptime(obj["__datetime__"], "%Y%m%dT%H:%M:%S.%f")
-    return obj
-
-def encode_datetime(obj):
-    if isinstance(obj, datetime.datetime):
-        return {'__datetime__': True, 'as_str': obj.strftime("%Y%m%dT%H:%M:%S.%f")}
-    return obj
-
 def proc_line(line,start_time,n_iter,n_outer_corr,n_corr,n_ortho):
     fields = line.split(',')
     solver, rest = fields[0].split(':')
@@ -52,50 +42,12 @@ class DictEncoder(json.JSONEncoder):
         else:
             return json.JSONEncoder.default(self, obj)
 
-
-class FoamServerException(Exception):
-    pass
-
 class BaseProcessor(object):
     def __call__(self,doc,*args):
         try:
             return self.TYPE, doc, self.process(doc,*args)
         except Exception as e:
             print(traceback.format_exc())
-
-class LogPostProcessor(BaseProcessor):
-    TYPE = 'log_post'
-    def process(self,postdoc,docs):
-        res = {
-            'iterations':{'time':[],'initial residual':{}},
-            'outer_iterations':{},
-            'corrector':{},
-        }
-        initial = {}
-        n_iter = 0
-        result = {
-            '$max':{'n_max':docs[-1]['n_max']},
-            '$min':{'n_min':docs[0]['n_min']},
-        }
-
-        for doc in docs:
-            for line in doc['data']:
-                if not 'data' in line:
-                    continue
-                data = line['data']
-                if 'time' in data:
-                    res['iterations']['time'].append(data['time'])
-                elif 'variable' in data:
-                    if data['variable'] not in initial:
-                        initial[data['variable']] = []
-                    initial[data['variable']].append(data['initial residual'])
-        push = {}
-        for x in initial:
-            push['data.iterations.initial residual.{0}'.format(x)] = {'$each':initial[x]}
-        if len(push):
-            result['$push'] = push
-        result['$set'] = {'modified':datetime.datetime.utcnow()}
-        return result
 
 class LogProcessor(BaseProcessor):
     TYPE = 'log'
@@ -241,7 +193,6 @@ class FoamPostProcessorHDF5(BaseApp):
                     self.process_doc(d_id)
                     self.redis.srem(self.currently_processing,d_id)
 
-
     def process_recompute_loop(self,queue):
         while not self._shutdown:
             d_id = self.redis.spop(queue)
@@ -310,6 +261,8 @@ class FoamPostProcessorHDF5(BaseApp):
                     # store into mongo
                     d_doc = d._asdict()
                     d_doc['n'] = n
+                    if d.type == 'dat':
+                        meta['starttime'] = self.get_starttime_from_dat_path(d.path)
                     self.db.archive.insert(
                         {'_id':d_doc,'meta':meta,'payload':payload})
                 except pymongo.errors.DuplicateKeyError:
@@ -375,7 +328,7 @@ class FoamPostProcessorHDF5(BaseApp):
                 else:
                     sg = group['run%s'%n_runs]
                 executable = self.process_log_header(sg,d_id,meta,lines)
-            elif 'simple' in executable or 'pimple' in executable:
+            elif 'simple' in executable or 'pimple' in executable or 'sonic' in executable:
                 self.process_log_imple(group['run%s'%n_runs],d_id,meta,lines)
                 executable = self.redis.hget(d_id,'executable')
                 n_runs = self.redis.hget(d_id,'n_runs')
@@ -527,7 +480,6 @@ class FoamPostProcessorHDF5(BaseApp):
         self.redis.hset(d_id,'cfl_max',cfl_max)
         self.redis.hset(d_id,'deltaT',deltaT)
 
-
     def process_system(self,group,d_id,meta,lines):
         pass
 
@@ -602,6 +554,14 @@ class FoamPostProcessorHDF5(BaseApp):
             header = third_line.strip('\n# ').split('\t')[1:]
         return header,ndim
 
+    def get_starttime_from_dat_path(self,path):
+        dirname,filename = os.path.split(path)
+        basename,ext = os.path.splitext(filename)
+        res = basename.split('_')
+        if len(res)>1:
+            return float(res[1])
+        else:
+            return float(os.path.split(dirname)[1])
 
 class FoamServer(BaseApp):
     SERVER_PUSH_PORT = 5051
@@ -632,8 +592,11 @@ class FoamServer(BaseApp):
         if self.redis.sadd('::'.join(('project',p_id)),d_id):
             logger.debug('added new doc: %s to %s',d_id,p_id)
         # append the msg to the doc
-        self.redis.hset(
-            '::'.join((doc_id,'msgs')),d['msg_number'],dumps((d,payload_msg)))
+        if not self.redis.hset(
+            '::'.join((doc_id,'msgs')),d['msg_number'],dumps((d,payload_msg))):
+            logger.error('failed to insert doc:%s',doc_id)
+        else:
+            logger.debug('inserted %s',doc_id)
         # push the msg id to the raw_queue
         self.redis.rpush(self.raw_queue,doc_id)
         # send response
