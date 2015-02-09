@@ -37,7 +37,7 @@ class PlyParser(object):
 
         # Build the lexer and parser
         self.lex = ply.lex.lex(module=self, debug=self.debug)
-        self.yacc = ply.yacc.yacc(module=self,debug=self.debug,check_recursion=self.debug,write_tables=False)
+        self.yacc = ply.yacc.yacc(errorlog=ply.yacc.NullLogger(),module=self,debug=self.debug,check_recursion=self.debug,write_tables=False)
 
     def parse(self,content):
         """Do the actual parsing
