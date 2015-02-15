@@ -422,7 +422,7 @@ class Harvester(object):
                 break
             # lets sleep a while
             else:
-                logger.degug('process loop sleeping, nothing to do')
+                logger.debug('process loop sleeping, nothing to do')
                 gevent.sleep(1.)
         # so it seems we are done
         self._processing_done = True
