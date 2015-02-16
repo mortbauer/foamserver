@@ -87,6 +87,7 @@ class EventHandler(RegexMatchingEventHandler):
                     self.enqueue(os.path.join(path,p))
 
     def on_modified(self,event):
+        logger.debug('eventhandler got change for %s',event.src_path)
         self.enqueue(event.src_path)
 
 
@@ -351,6 +352,7 @@ class Harvester(object):
                 regexes=item.get('regexes',processor.REGEXES))
             # fire my initialitation
             handler.init(item['path'],recursive)
+            logger.debug('sheduled observer for path %s %s %s',item['path'],recursive,item.get('regexes',processor.REGEXES))
             self.observer.schedule(handler,item['path'],recursive=recursive)
 
     def resend(self):
@@ -409,6 +411,7 @@ class Harvester(object):
             task = self.redis.lpop(self._pqueue)
             if task:
                 _type, path = loads(task)
+                logger.debug('working on task %s',path)
                 relpath = os.path.relpath(path,self.meta['root_path'])
                 for meta,payload in self.processors[_type](relpath):
                     key = {'project':self.meta,'doc':meta}
