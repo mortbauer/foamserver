@@ -41,6 +41,7 @@ CONFIG_SCHEMA = {
                 'allowed':['log','dat','system'],
             },'path':{'type':'string','required':True},
             'regexes':{'type':'list','schema':{'type':'string'}},
+            'ignore_regexes':{'type':'list','schema':{'type':'string'}},
             'recursive':{'type':'boolean'},
         }
     }}
@@ -66,8 +67,9 @@ def encode_datetime(obj):
 
 
 class EventHandler(RegexMatchingEventHandler):
-    def __init__(self,redis,queuename,proctype,regexes=None):
-        super(EventHandler,self).__init__(regexes=regexes,ignore_directories=True)
+    def __init__(self,redis,queuename,proctype,regexes=None,ignore_regexes=None):
+        super(EventHandler,self).__init__(
+            regexes=regexes,ignore_regexes=ignore_regexes,ignore_directories=True)
         self.redis = redis
         self.queuename = queuename
         self.type = proctype
@@ -79,11 +81,13 @@ class EventHandler(RegexMatchingEventHandler):
         if recursive:
             for root, dirs, files in os.walk(path):
                 for p in files:
-                    if any(r.match(p) for r in self.regexes):
+                    if any(r.match(p) for r in self.regexes) and not \
+                            any(r.match(p) for r in self.ignore_regexes):
                         self.enqueue(os.path.join(root,p))
         else:
             for p in os.listdir(path):
-                if any(r.match(p) for r in self.regexes):
+                if any(r.match(p) for r in self.regexes) and not \
+                        any(r.match(p) for r in self.ignore_regexes):
                     self.enqueue(os.path.join(path,p))
 
     def on_modified(self,event):
@@ -119,6 +123,7 @@ class BaseProcessor(object):
 
 class SystemProcessor(BaseProcessor):
     REGEXES = ['[a-z_\-A-Z]+']
+    IGNORE_REGEXES = []
     TYPE = 'system'
 
     def test_reset(self,path):
@@ -154,6 +159,7 @@ class SystemProcessor(BaseProcessor):
 
 class DatProcessor(BaseProcessor):
     REGEXES = ['.*\.dat']
+    IGNORE_REGEXES = ['.*\.vtk']
     TYPE = 'dat'
 
     def test_reset(self,path):
@@ -207,6 +213,7 @@ class DatProcessor(BaseProcessor):
 
 class LogProcessor(DatProcessor):
     REGEXES = ['log\.']
+    IGNORE_REGEXES = []
     TYPE = 'log'
 
 
@@ -349,7 +356,9 @@ class Harvester(object):
             recursive = item.get('recursive')
             handler = EventHandler(
                 self.redis,self._pqueue,item['type'],
-                regexes=item.get('regexes',processor.REGEXES))
+                regexes=item.get('regexes',processor.REGEXES),
+                ignore_regexes=item.get('ignore_regexes',processor.IGNORE_REGEXES),
+            )
             # fire my initialitation
             handler.init(item['path'],recursive)
             logger.debug('sheduled observer for path %s %s %s',item['path'],recursive,item.get('regexes',processor.REGEXES))
