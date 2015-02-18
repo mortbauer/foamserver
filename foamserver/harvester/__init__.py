@@ -411,6 +411,8 @@ class Harvester(object):
             task = self.redis.lpop(self._pqueue)
             if task:
                 _type, path = loads(task)
+                if os.path.isdir(path):
+                    continue
                 logger.debug('working on task %s',path)
                 relpath = os.path.relpath(path,self.meta['root_path'])
                 for meta,payload in self.processors[_type](relpath):
