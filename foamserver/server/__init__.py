@@ -544,7 +544,7 @@ class FoamPostProcessorHDF5(BaseApp):
 
     def process_dat_header(self,lines):
         headlines = []
-        while lines[0].startswith('#'):
+        while lines[0].strip().startswith('#'):
             headlines.append(lines.pop(0))
         if len(headlines)==3 and 'Forces' in headlines[0]:
             ndim = 2
