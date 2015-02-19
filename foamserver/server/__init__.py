@@ -484,90 +484,90 @@ class FoamPostProcessorHDF5(BaseApp):
         pass
 
     def process_dat(self,group,d_id,meta,lines):
-        header,ndim,nh = self.process_dat_collective(group,d_id,meta,lines)
-        # create temporary numpy arrays since the are much faster then hdf5
-        # access
-        n_curr_msg = self.redis.hget(d_id,'n_curr')
-        n_curr = 0 if n_curr_msg is None else int(n_curr_msg)
-        size = meta['n_max']-n_curr-(nh-1)
-        shape = (size,) if ndim == 1 else (size,3)
-        timeset = numpy.empty((size,))
-        cols = [numpy.empty(shape) for x in header]
-        if ndim == 2:
+        size,ndim,header,cols = self.process_dat_collective(group,d_id,meta,lines)
+        i = 0
+        if ndim > 1:
             for i,line in enumerate(lines):
                 time,fields = line.strip().split('\t')
-                timeset[i] = float(time)
+                cols[0][i] = float(time)
                 for j,main_field in enumerate(fields.split(') ')):
                     for k,x in enumerate(main_field.strip('()').split()):
-                        cols[j][i,k] = float(x)
+                        cols[j+1][i,k] = float(x)
         else:
             for i,line in enumerate(lines):
                 if '\t' in line:# openfoam insert \t but swak4Foam doesn't
                     fields = line.strip().split('\t')
                 else:
                     fields = line.split()
-                timeset[i] = float(fields[0])
+                cols[0][i] = float(fields[0])
                 for j,x in enumerate(fields[1:]):
-                    cols[j][i] = float(x)
+                    cols[j+1][i] = float(x)
         self.redis.hincrby(d_id,'n_curr',i+1)
         # transfer the data from our temporary numpy arrays to hdf5
-        for i,x in enumerate(header):
+        for i,(x,n_cols) in enumerate(header):
             group[x][-size:] = cols[i]
-        group['Time'][-size:] = timeset
+            #print(x,i,cols[i])
 
     def process_dat_collective(self,group,d_id,meta,lines):
         # take the header from redis if there is
         header_msg = self.redis.hget(d_id,'header')
         if header_msg is None:
-            header,ndim,nh = self.process_dat_header(lines)
-            self.redis.hset(d_id,'header',dumps(header))
-            self.redis.hset(d_id,'ndim',ndim)
-            self.redis.hset(d_id,'nheadlines',nh)
+            header,nh = self.process_dat_header(d_id,lines)
         else:
             header = loads(header_msg)
-            ndim = int(self.redis.hget(d_id,'ndim'))
             nh = int(self.redis.hget(d_id,'nheadlines'))
         # create the groups/dataset in the hdf5 if not there otherwise resize
         n_max = meta['n_max']-(nh-1)
-        shape = (n_max,) if ndim == 1 else (n_max,3)
-        mshape = (None,) if ndim == 1 else (None,3)
-        for key in header:
+        cols = []
+        n_cols_max = 0
+        for key,n_cols in header:
+            if n_cols > n_cols_max:
+                n_cols_max = n_cols
             if key in group:
-                group[key].resize(shape)
+                curr_size = group[key].shape[0]
+                size = n_max-curr_size
+                group[key].resize((n_max,n_cols)if n_cols>1 else (n_max,))
             else:
-                group.create_dataset(key,shape,'f8',chunks=True,maxshape=mshape)
-        if 'Time' in group:
-            group['Time'].resize((n_max,))
-        else:
-            group.create_dataset('Time',(n_max,),'f8',chunks=True,maxshape=(None,))
-        return header,ndim,nh
+                group.create_dataset(
+                    key,(n_max,n_cols)if n_cols>1 else (n_max,),
+                    'f8',chunks=True,maxshape=(None,n_cols)if n_cols>1 else (None,))
+                size = n_max
+            cols.append(numpy.empty((size,n_cols)if n_cols>1 else (size,)))
 
-    def process_dat_header(self,lines):
+        #print(d_id,size,n_max,n_curr,shape,header)
+        return size,n_cols_max,header,cols
+
+    def process_dat_header(self,d_id,lines):
         headlines = []
-        while lines[0].strip().startswith('#'):
+        while lines and lines[0].strip().startswith('#'):
             headlines.append(lines.pop(0))
         if len(headlines)==3 and 'Forces' in headlines[0]:
-            ndim = 2
             header = []
             comment,time,fields = headlines[2].split(' ',2)
+            header.append((time,1))
             for main_field in fields.strip().split(') '):
                 key,minor_fields = main_field.split('(')
                 for minor in minor_fields.split():
-                    header.append('/'.join((key,minor.strip(')'))))
+                    header.append(('/'.join((key,minor.strip(')'))),3))
         else:
-            ndim = 1
             if '\t' in headlines[-1]:# openfoam insert \t but swak4Foam doesn't
-                header = headlines[-1].strip('\n# ').split('\t')[1:]
+                header = [(x,1) for x in headlines[-1].strip('\n# ').split('\t')]
             else:
-                header = headlines[-1].strip('\n# ').split()
-        return header,ndim,len(headlines)
+                header = [(x,1) for x in headlines[-1].strip('\n# ').split()]
+        nh = len(headlines)
+        self.redis.hset(d_id,'header',dumps(header))
+        self.redis.hset(d_id,'nheadlines',nh)
+        return header,nh
 
     def get_starttime_from_dat_path(self,path):
         dirname,filename = os.path.split(path)
         basename,ext = os.path.splitext(filename)
         res = basename.split('_')
         if len(res)>1:
-            return float(res[1])
+            try:
+                return float(res[1])
+            except:
+                return float(os.path.split(dirname)[1])
         else:
             return float(os.path.split(dirname)[1])
 
