@@ -158,7 +158,7 @@ class SystemProcessor(BaseProcessor):
             d['hash'] = _hash
 
 class DatProcessor(BaseProcessor):
-    REGEXES = ['.*\.dat']
+    REGEXES = ['.*']
     IGNORE_REGEXES = ['.*\.vtk']
     TYPE = 'dat'
 
@@ -222,14 +222,17 @@ INITIAL_CONFIG = {
         {'type':'system',
          'path':'system',
          'recursive':False,
+         'ignore_regexes':SystemProcessor.IGNORE_REGEXES,
          'regexes':SystemProcessor.REGEXES},
         {'type':'log',
          'path':'.',
          'recursive':False,
+         'ignore_regexes':LogProcessor.IGNORE_REGEXES,
          'regexes':LogProcessor.REGEXES},
         {'type':'dat',
          'path':'postProcessing',
          'recursive':True,
+         'ignore_regexes':DatProcessor.IGNORE_REGEXES,
          'regexes':DatProcessor.REGEXES},
     ]
 }
@@ -556,9 +559,18 @@ def start(oneshot,debug,loglevel):
     harvester.start(oneshot=oneshot)
 
 
+@run.command('uuid')
+def print_uuid():
+    logger.setLevel('CRITICAL')
+    harvester = Harvester()
+    print(str(harvester.uuid))
+
 @run.command()
 def info():
+    logger.setLevel('CRITICAL')
     harvester = Harvester()
+    print('project uuid: {0}'.format(harvester.uuid))
+    print('tracked files are:\n')
     for key in harvester.state:
         print('{0}:'.format(key))
         for path in harvester.state[key]:
