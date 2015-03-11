@@ -545,10 +545,11 @@ def run():
     pass
 
 @run.command()
+@click.option('--pattern')
 @click.option('--oneshot',default=False,is_flag=True)
 @click.option('-d','--debug',default=False,is_flag=True)
 @click.option('-l','--loglevel',default='error')
-def start(oneshot,debug,loglevel):
+def start(oneshot,debug,loglevel,pattern):
     if hasattr(logging,loglevel.upper()):
         logger.setLevel(loglevel.upper())
     else:
@@ -556,6 +557,13 @@ def start(oneshot,debug,loglevel):
     if debug:
         logger.setLevel(logging.DEBUG)
     harvester = Harvester()
+    if pattern is not None:
+        PATTERN = re.compile(pattern)
+        newdict = []
+        for item in harvester.conf['watch']:
+            if PATTERN.match(item['path']):
+                newdict.append(item)
+        harvester.conf['watch'] = newdict
     harvester.start(oneshot=oneshot)
 
 
