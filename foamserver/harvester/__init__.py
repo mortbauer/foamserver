@@ -34,6 +34,7 @@ VERSION = 0.2
 CONFIG_SCHEMA = {
     'project': {'type': 'string','required':True},
     'redis_password': {'type': 'string','required':False},
+    'redis_host': {'type': 'string','required':False},
     'watch':{'type':'list','required':True,'schema':{
         'type':'dict','schema':{
             'type':{
@@ -474,7 +475,11 @@ class Harvester(object):
             return True
 
     def start(self,oneshot=False):
-        self.redis = redis.StrictRedis(self.conf['redis_password'])
+        redis_kwargs = {}
+        for x in self.conf:
+            if x.startswith('redis_'):
+                redis_kwargs[x[6:]] = self.conf[x]
+        self.redis = redis.StrictRedis(**redis_kwargs)
         try:
             self.init_handlers()
             # reque the unconfirmed messages, but give some time to get confirmation
