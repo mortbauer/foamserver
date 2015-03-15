@@ -44,6 +44,7 @@ CONFIG_SCHEMA = {
             },'path':{'type':'string','required':True},
             'regexes':{'type':'list','schema':{'type':'string'}},
             'ignore_regexes':{'type':'list','schema':{'type':'string'}},
+            'root_regexes':{'type':'list','schema':{'type':'string'}},
             'recursive':{'type':'boolean'},
         }
     }}
@@ -69,11 +70,12 @@ def encode_datetime(obj):
 
 
 class EventHandler(RegexMatchingEventHandler):
-    def __init__(self,redis,queuename,proctype,regexes=None,ignore_regexes=None):
+    def __init__(self,redis,queuename,proctype,regexes=None,ignore_regexes=None,root_regexes=None):
         super(EventHandler,self).__init__(
             regexes=regexes,ignore_regexes=ignore_regexes,ignore_directories=True)
         self.redis = redis
         self.queuename = queuename
+        self.root_regexes = [] if root_regexes is None else [re.compile(x) for x in root_regexes]
         self.type = proctype
 
     def enqueue(self,path):
@@ -82,10 +84,11 @@ class EventHandler(RegexMatchingEventHandler):
     def init(self,path,recursive):
         if recursive:
             for root, dirs, files in os.walk(path):
-                for p in files:
-                    if any(r.match(p) for r in self.regexes) and not \
-                            any(r.match(p) for r in self.ignore_regexes):
-                        self.enqueue(os.path.join(root,p))
+                if any(r.match(root) for r in self.root_regexes):
+                    for p in files:
+                        if any(r.match(p) for r in self.regexes) and not \
+                                any(r.match(p) for r in self.ignore_regexes):
+                            self.enqueue(os.path.join(root,p))
         else:
             for p in os.listdir(path):
                 if any(r.match(p) for r in self.regexes) and not \
@@ -362,6 +365,7 @@ class Harvester(object):
             handler = EventHandler(
                 self.redis,self._pqueue,item['type'],
                 regexes=item.get('regexes',processor.REGEXES),
+                root_regexes=item.get('root_regexes',['.*']),
                 ignore_regexes=item.get('ignore_regexes',processor.IGNORE_REGEXES),
             )
             # fire my initialitation
