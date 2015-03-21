@@ -19,9 +19,7 @@ import pprint
 import cerberus
 import redis
 import gevent
-import gevent.event
 import gevent.select
-import gevent.fileobject
 import hashlib
 from json import dumps, loads
 import zmq.green as zmq
@@ -29,7 +27,7 @@ import watchdog.observers
 from watchdog.observers.api import ObservedWatch
 from watchdog.events import RegexMatchingEventHandler
 
-VERSION = 0.2
+VERSION = 0.3
 
 CONFIG_SCHEMA = {
     'project': {'type': 'string','required':True},
@@ -140,27 +138,29 @@ class SystemProcessor(BaseProcessor):
             'msg_number':0,
             'initially_tracked':datetime.datetime.utcnow(),
             'hash':None,
+            'mtime':0,
         }
 
     def process(self,path):
         d = self.data[path]
-        doc = {
-            'msg_number':d['msg_number'],
-            'timestamp':time.time(),
-            'path':path,
-            'initially_tracked':d['initially_tracked'],
-        }
-        hasher = hashlib.md5()
-        with open(path,'r') as f:
-            text = f.read()
-            hasher.update(text)
-            _hash = hasher.hexdigest()
+        if os.stat(path).st_mtime > d['mtime']:
+            doc = {
+                'msg_number':d['msg_number'],
+                'timestamp':time.time(),
+                'path':path,
+                'initially_tracked':d['initially_tracked'],
+            }
+            hasher = hashlib.md5()
+            with open(path,'r') as f:
+                text = f.read()
+                hasher.update(text)
+                _hash = hasher.hexdigest()
 
-        # send only if data really changed
-        if _hash != d['hash']:
-            yield doc,text
-            d['msg_number'] += 1
-            d['hash'] = _hash
+            # send only if data really changed
+            if _hash != d['hash']:
+                yield doc,text
+                d['msg_number'] += 1
+                d['hash'] = _hash
 
 class DatProcessor(BaseProcessor):
     REGEXES = ['.*']
@@ -168,17 +168,29 @@ class DatProcessor(BaseProcessor):
     TYPE = 'dat'
 
     def test_reset(self,path):
+        self.hasher = hashlib.md5()
         if path not in self.data:
             return True
         elif os.stat(path).st_size < self.data[path]['pos']:
             return True
+        elif os.stat(path).st_mtime > self.data[path]['mtime']:
+            with open(path,'r') as f:
+                txt = f.read(self.data[path]['pos'])
+                self.hasher.update(txt)
+                _hash = self.hasher.hexdigest()
+            if _hash != self.data[path]['hash']:
+                return True
+
 
     def initialize(self,path):
+        self.hasher = hashlib.md5()
         self.data[path] = {
             'msg_number':0,
             'initially_tracked':datetime.datetime.utcnow(),
             'pos':0,
-            'line_number':0
+            'line_number':0,
+            'mtime':0,
+            'hash':None,
         }
 
     def process(self,path):
@@ -192,6 +204,7 @@ class DatProcessor(BaseProcessor):
             'initially_tracked':d['initially_tracked'],
         }
         with open(path,'r') as f:
+            d['mtime'] = time.time()
             f.seek(d['pos'])
             data = []
             counter = 0
@@ -201,11 +214,13 @@ class DatProcessor(BaseProcessor):
             # see also: http://stackoverflow.com/q/14145082
             for line in iter(f.readline, ''):
                 data.append(line)
+                self.hasher.update(line)
                 if counter >= self.MAX_LINES:
                     yield nd(d['line_number'],nlines),data
                     d['msg_number'] += 1
                     d['pos'] = f.tell()
                     d['line_number'] = nlines
+                    d['hash'] = self.hasher.hexdigest()
                     data = []
                     counter = 0
                 counter += 1
@@ -215,6 +230,7 @@ class DatProcessor(BaseProcessor):
                 d['msg_number'] += 1
                 d['pos'] = f.tell()
                 d['line_number'] = nlines
+                d['hash'] = self.hasher.hexdigest()
 
 class LogProcessor(DatProcessor):
     REGEXES = ['log\.']
@@ -249,13 +265,11 @@ processors = {
 }
 
 class Harvester(object):
-    SLEEP_TIME = 2
     PERSISTENCE = '.harvester.json'
-    SERVER_PUSH_PORT = 5051
-    SERVER_PULL_PORT = 5052
     CONF = 'harvester.yaml'
-    MAX_PILE_UP = 200
-    RCVTIMEO = 1000
+    SERVER_PORT = 5051
+    HWM = 100
+    TIMEOUT = 1000
     PROCESSORS = (LogProcessor,DatProcessor,SystemProcessor)
 
     def __init__(self,logging=True):
@@ -267,39 +281,36 @@ class Harvester(object):
         self._observer_started = False
         self._oneshot = False
         self._processing_done = False
+        self.timeout = 1
         self.meta = {
             'host':socket.gethostname(),
             'root_path':os.path.abspath('.'),
         }
         self.load_conf()
         self.load_state()
-        self.context = zmq.Context()
-        self.s_sock = self.context.socket(zmq.PUSH)
-        self.r_sock = self.context.socket(zmq.PULL)
-        self.r_sock.hwm = 100
-        self.connect_sockets()
-        self._uncon = self.make_redis_name('unconfirmed')
+        self.connect()
         self._pqueue = self.make_redis_name('processing')
         self._squeue = self.make_redis_name('sending')
         self._store = self.make_redis_name('payloadstore')
-        self.uncon_len = lambda : self.redis.scard(self._uncon)
         self.pqueu_len = lambda : self.redis.llen(self._pqueue)
         self.squeu_len = lambda : self.redis.llen(self._squeue)
         self.observer = watchdog.observers.Observer()
         self.processors = {x.TYPE:x(self.state) for x in self.PROCESSORS}
-        self.resend_finnished = gevent.event.Event()
 
     def make_redis_name(self,name):
         return 'foamserver_harvester_{0}_{1}'.format(self.uuid,name)
 
-    def connect_sockets(self):
-        self.s_sock.connect('tcp://{0}:{1}'.format(
+    def connect(self):
+        self.context = zmq.Context()
+        self.sock = self.context.socket(zmq.DEALER)
+        self.sock.set_hwm(self.HWM)
+        self.sock.connect('tcp://{0}:{1}'.format(
             self.conf.get('host','localhost'),
-            self.conf.get('port',self.SERVER_PULL_PORT)))
+            self.conf.get('port',self.SERVER_PORT)))
 
-        self.r_sock.connect('tcp://{0}:{1}'.format(
-            self.conf.get('host','localhost'),
-            self.conf.get('pull_port',self.SERVER_PUSH_PORT)))
+    def terminate_connection(self):
+        self.sock.close(linger=0)
+        self.context.destroy()
 
     def load_conf(self):
         v = cerberus.Validator(CONFIG_SCHEMA)
@@ -373,39 +384,37 @@ class Harvester(object):
             logger.debug('sheduled observer for path %s %s %s',item['path'],recursive,item.get('regexes',processor.REGEXES))
             self.observer.schedule(handler,item['path'],recursive=recursive)
 
-    def resend(self):
-        i = 0
-        for key_msg in self.redis.hkeys(self._store):
-            self.redis.rpush(self._squeue,key_msg)
-            i += 1
-        if i:
-            return True
-
-    def receive_loop(self):
-        logger.debug('receive_loop ready')
-        while not self._shutdown:
-            # break if we wanna stop and have everything confirmed
-            if self._processing_done and not self.uncon_len():
-                break
-            try:
-                msg = self.r_sock.recv_multipart(flags=zmq.NOBLOCK)
-            except zmq.ZMQError:
-                gevent.sleep(1.)
-            else:
-                if 'confirm' == msg[0]:
-                    payload = self.redis.hget(self._store,msg[1])
-                    if payload:
-                        if hash(payload) == loads(msg[2]):
-                            ok = self.redis.srem(self._uncon,msg[1])
-                            ok = self.redis.hdel(self._store,msg[1])
+    def send_receive(self,key_msg,payload_msg):
+        self.sock.send_multipart(['','data!',key_msg,payload_msg])
+        hashed = str(hash(payload_msg))
+        sent = time.time()
+        self.timeout = 1
+        lastlive = 0
+        while not (self._shutdown or self._stop):
+            if self.sock.poll(self.TIMEOUT,flags=zmq.POLLIN):
+                msg = self.sock.recv_multipart()
+                if msg[1] == 'confirm!':
+                    if msg[2] == key_msg and msg[3] == hashed:
+                        return True
                     else:
-                        logger.error('not in store: %s',msg[1])
-        logger.debug('ending receive_loop')
+                        print('message {0} doesn\'t need confirmmation'.format(msg[2]))
+                elif msg[1] == 'alive!':
+                    lastlive = time.time()
+                    if (float(msg[2])-sent) > 1:
+                        self.sock.send_multipart(['','data!',key_msg,payload_msg])
+                        sent = time.time()
+                        print('resending %s'%key_msg)
+                else:
+                    print('unknown command "%s"'%msg[1])
+            else:
+                if (time.time() - lastlive) > (self.timeout):
+                    self.sock.send_multipart(['','alive?',str(time.time())],flags=zmq.NOBLOCK)
+                    self.timeout += 1
 
     def send_loop(self):
         logger.debug('send_loop ready')
         while not self._stop:
-            key_msg = self.redis.lpop(self._squeue)
+            key_msg = self.redis.lindex(self._squeue,0)
             if key_msg:
                 if logger.level <= logging.INFO:
                     key = loads(key_msg)
@@ -413,8 +422,8 @@ class Harvester(object):
                 payload_msg = self.redis.hget(self._store,key_msg)
                 # it could be that the item was removed because it was confirmed
                 if payload_msg:
-                    self.redis.sadd(self._uncon,key_msg)
-                    self.s_sock.send_multipart(['new',key_msg,payload_msg])
+                    if self.send_receive(key_msg,payload_msg):
+                        self.redis.lpop(self._squeue)
             else:
                 # seems we are done
                 if self._processing_done:
@@ -466,17 +475,12 @@ class Harvester(object):
         self._shutdown = True
         if not self._stopped:
             self._stopped = True
-            self.s_sock.close(linger=0)
-            self.r_sock.close(linger=0)
+            self.sock.close(linger=0)
             self.context.term()
 
     def stop(self):
         self._stop = True
         self.stop_observer()
-        if self.redis.scard(self._uncon) > 0:
-            return False
-        else:
-            return True
 
     def start(self,oneshot=False):
         redis_kwargs = {}
@@ -486,11 +490,6 @@ class Harvester(object):
         self.redis = redis.StrictRedis(**redis_kwargs)
         try:
             self.init_handlers()
-            # reque the unconfirmed messages, but give some time to get confirmation
-            # before
-            wait = 0.0
-            if self.resend():
-                wait = 2.0
             # starte or not start observer
             if not oneshot:
                 self.start_observer()
@@ -503,7 +502,6 @@ class Harvester(object):
             gevent.joinall([
                 gevent.spawn(self.process_loop),
                 gevent.spawn(self.send_loop),
-                gevent.spawn(self.receive_loop),
             ])
             # save the state,
             signal.signal(signal.SIGINT, self.save_interrupt_handler)

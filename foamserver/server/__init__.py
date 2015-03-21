@@ -572,19 +572,18 @@ class FoamPostProcessorHDF5(BaseApp):
             return float(os.path.split(dirname)[1])
 
 class FoamServer(BaseApp):
-    SERVER_PUSH_PORT = 5051
-    SERVER_PULL_PORT = 5052
+    SERVER_PORT = 5051
     NAME = 'server'
+    TIMEOUT = 1000
 
     def __init__(self,**kwargs):
         super(FoamServer,self).__init__(**kwargs)
         self._p_store = self.make_redis_name('project_store')
         self.context = zmq.Context()
-        self.s_sock = self.context.socket(zmq.PUSH)
-        self.r_sock = self.context.socket(zmq.PULL)
+        self.sock = self.context.socket(zmq.ROUTER)
         self.msg_counter = 0
 
-    def handle_msg(self,doc_msg,payload_msg):
+    def handle_data(self,doc_msg,payload_msg):
         doc = loads(doc_msg)
         d = doc['doc']
         p = doc['project']
@@ -602,30 +601,34 @@ class FoamServer(BaseApp):
         # append the msg to the doc
         if not self.redis.hset(
             '::'.join((doc_id,'msgs')),d['msg_number'],dumps((d,payload_msg))):
-            logger.error('failed to insert doc:%s',doc_id)
+            logger.debug('doc:%s already up to date',doc_id)
         else:
             logger.debug('inserted %s',doc_id)
         # push the msg id to the raw_queue
         self.redis.rpush(self.raw_queue,doc_id)
         # send response
-        self.s_sock.send_multipart(
-            ['confirm',doc_msg,dumps(hash(payload_msg))])
+        return doc_msg,dumps(hash(payload_msg))
 
     def receive_loop(self):
         while not self._shutdown:
             try:
-                msg = self.r_sock.recv_multipart(flags=zmq.NOBLOCK)
-            except zmq.ZMQError:
-                gevent.sleep(1.)
-            else:
-                if 'new' == msg[0] :
-                    self.handle_msg(msg[1],msg[2])
+                if self.sock.poll(self.TIMEOUT,flags=zmq.POLLIN):
+                    msg = self.sock.recv_multipart()
+                    if msg[2] == 'data!':
+                        doc_id,msg_hash = self.handle_data(msg[3],msg[4])
+                        self.sock.send_multipart([msg[0],'','confirm!',doc_id,msg_hash])
+                    elif msg[2] == 'alive?':
+                        if (time.time()-float(msg[3])) < 1:
+                            self.sock.send_multipart([msg[0],'','alive!',str(time.time())])
+                    else:
+                        print('unknown command "%s"'%msg[2])
                 else:
                     gevent.sleep(1.)
+            except zmq.ZMQError:
+                gevent.sleep(1.)
 
     def connect(self):
-        self.s_sock.bind("tcp://*:%s"%self.SERVER_PUSH_PORT)
-        self.r_sock.bind("tcp://*:%s"%self.SERVER_PULL_PORT)
+        self.sock.bind("tcp://*:%s"%self.SERVER_PORT)
 
     def start(self):
         super(FoamServer,self).start()
