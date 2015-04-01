@@ -9,7 +9,6 @@ import uuid
 import json
 import yaml
 import time
-import gipc
 import copy
 import click
 import signal
