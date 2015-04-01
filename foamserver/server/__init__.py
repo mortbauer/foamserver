@@ -8,7 +8,7 @@ import h5py
 import click
 import numpy
 import redis
-import pymongo
+#import pymongo
 import gevent
 import signal
 import logging
@@ -26,13 +26,13 @@ logger = logging.getLogger('foamserver_server')
 logger.setLevel(logging.INFO)
 fm = logging.Formatter(fmt)
 
-def proc_line(line,start_time,n_iter,n_outer_corr,n_corr,n_ortho):
+def proc_line(line):
     fields = line.split(',')
     solver, rest = fields[0].split(':')
     key = rest.split()[-1]
     dd = (solver,float(fields[1].strip().split('=')[-1]),
         float(fields[2].strip().split('=')[-1]),
-        int(fields[3].strip().split()[-1]),start_time,n_iter,n_outer_corr,n_corr,n_ortho)
+        int(fields[3].strip().split()[-1]))
     return key,dd,fields[0]
 
 class DictEncoder(json.JSONEncoder):
@@ -134,10 +134,9 @@ class BaseApp(object):
         if not os.path.isfile(conffile):
             with open(conffile,'w') as f:
                 f.write(yaml.dump(self.CONF))
+        self.conf = self.CONF.copy()
         with open(conffile,'r') as f:
-            self.conf = yaml.load(f.read())
-        if self.conf is None:
-            self.conf= {}
+            self.conf.update(yaml.load(f.read()))
 
     def add_logging_file_handler(self):
         logfile = self.conf.get('logfile')
@@ -155,7 +154,7 @@ class BaseApp(object):
 class FoamPostProcessorHDF5(BaseApp):
     NAME = 'postpro'
     CONF = {
-        'datafile':'foamserver_data.h5',
+        'datadir':'foamserver_postpro_data',
     }
     doc = collections.namedtuple(
         'doc',['host','project','uuid','type','path','initially'])
@@ -179,8 +178,8 @@ class FoamPostProcessorHDF5(BaseApp):
         super(FoamPostProcessorHDF5,self).__init__(**kwargs)
         self.currently_processing = self.make_redis_name('currently_processing')
         self._failed = self.make_redis_name('failed')
-        self.conn = pymongo.MongoClient()
-        self.db = self.conn['foamserver_postpro']
+        #self.conn = pymongo.MongoClient()
+        #self.db = self.conn['foamserver_postpro']
 
     def process_loop(self):
         while not self._shutdown:
@@ -199,10 +198,21 @@ class FoamPostProcessorHDF5(BaseApp):
             if d_id is None:
                 break
             else:
+                if d_id.endswith('msgs'):
+                    continue
+                doc_id = self.doc(*d_id[5:].split('::'))
+                h5filepath = os.path.join(self.datadir,'%s.h5'%doc_id.uuid)
+                file_id = '/'.join((doc_id.type,doc_id.path,doc_id.initially))
+                mode = 'r+' if os.path.isfile(h5filepath) else 'w'
                 if self.redis.sadd(self.currently_processing,d_id):
                     self.redis.delete(d_id)
-                    del self.datastore[self.redisid_to_h5id(d_id)]
-                    logger.warn('deleted: %s from redis and datastore',d_id)
+                    try:
+                        with h5py.File(h5filepath,mode) as datastore:
+                            if file_id in datastore:
+                                del datastore[file_id]
+                                logger.warn('resetted state for: %s',file_id)
+                    except Exception as e:
+                        logger.error(e)
                     self.process_doc(d_id)
                     self.redis.srem(self.currently_processing,d_id)
 
@@ -225,86 +235,54 @@ class FoamPostProcessorHDF5(BaseApp):
                     self.redis.srem(self.currently_processing,d_id)
 
     def process_doc(self,d_id):
-        d = self.doc(*d_id[5:].split('::'))
-        h5_id = d_id[5:].replace('::','/')
-        processor = getattr(self,'process_%s'%d.type)
-        #print('poping of %s'%d_id)
-        if not h5_id in self.datastore:
-            group = self.datastore.create_group(h5_id)
-            # create also a shortcut to the new data
-            # project wide
-            latest = '/'.join((d.host,d.project,'latest'))
-            if latest in self.datastore:
-                del self.datastore[latest]
-            self.datastore[latest] = self.datastore['/'.join((d.host,d.project,d.uuid))]
-            # doc wide
-            latest = '/'.join((group.parent.name,'latest'))
-            if latest in self.datastore:
-                del self.datastore[latest]
-            self.datastore[latest] = self.datastore[group.name]
-        else:
-            group = self.datastore[h5_id]
-        msgs_id = '::'.join((d_id,'msgs'))
-        while not self._shutdown:
-            n = self.redis.hget(d_id,'next')
-            if n is None:
-                n = '0'
-            msg = self.redis.hget(msgs_id,n)
-            if not msg:
-                break
+        doc_id = self.doc(*d_id[5:].split('::'))
+        h5filepath = os.path.join(self.datadir,'%s.h5'%doc_id.uuid)
+        file_id = '/'.join((doc_id.type,doc_id.path,doc_id.initially))
+        processor = getattr(self,'process_%s'%doc_id.type)
+        msghash_key = '::'.join((d_id,'msgs'))
+        mode = 'r+' if os.path.isfile(h5filepath) else 'w'
+        with h5py.File(h5filepath,mode) as datastore:
+            if not file_id in datastore:
+                group = datastore.create_group(file_id)
             else:
-                meta,payload_msg = loads(msg)
-                payload = loads(payload_msg)
-                group = self.datastore[h5_id]
-                t0 = time.time()
-                try:
-                    # store into mongo
-                    d_doc = d._asdict()
-                    d_doc['n'] = n
-                    if d.type == 'dat':
-                        meta['starttime'] = self.get_starttime_from_dat_path(d.path)
-                    self.db.archive.insert(
-                        {'_id':d_doc,'meta':meta,'payload':payload})
-                except pymongo.errors.DuplicateKeyError:
-                    logger.debug('msg already in archive: %s',d_id)
-                try:
-                    processor(group,d_id,meta,payload)
-                except Exception as e:
-                    logger.critical('failed to process: %s::%s \n %s',d_id,n,e)
-                    print(traceback.format_exc())
-                    n_failed = self.redis.hincrby(d_id,'failed')
-                    self.redis.sadd('::'.join((self._failed,str(n_failed))),d_id)
+                group = datastore[file_id]
+            while not self._shutdown:
+                n = self.redis.hget(d_id,'next')
+                if n is None:
+                    n = '0'
+                msg = self.redis.hget(msghash_key,n)
+                if not msg:
                     break
                 else:
-                    self.redis.hincrby(d_id,'next')
-                    logger.debug('processed %s::%s in %s sec',d_id,n,time.time()-t0)
-                    #self.redis.hdel(msgs_id,n)
-                    self.datastore.flush()
+                    meta,payload_msg = loads(msg)
+                    payload = loads(payload_msg)
+                    t0 = time.time()
+                    try:
+                        processor(group,d_id,meta,payload)
+                    except Exception as e:
+                        logger.critical('failed to process: %s::%s::%s \n %s',doc_id.uuid,doc_id.path,n,e)
+                        print(traceback.format_exc())
+                        n_failed = self.redis.hincrby(d_id,'failed')
+                        self.redis.sadd('::'.join((self._failed,str(n_failed))),d_id)
+                        break
+                    else:
+                        self.redis.hincrby(d_id,'next')
+                        logger.debug('processed %s::%s::%s in %s sec',doc_id.uuid,doc_id.path,n,time.time()-t0)
+                        datastore.flush()
 
     def start(self,failed=None,reprocess=None):
         super(FoamPostProcessorHDF5,self).start()
+        self.datadir = self.conf['datadir']
+        if not os.path.isdir(self.datadir):
+            os.makedirs(self.datadir)
+            logger.info('created datadir "%s"',self.datadir)
         logger.info("started server")
-        filename = self.conf.get('datafile','%s.h5'%self.name)
-        try:
-            #self.datastore = h5py.File(
-                #filename,'r+',driver='mpio',comm=MPI.COMM_WORLD)
-            self.datastore = h5py.File(filename,'r+')
-        except IOError:
-            #self.datastore = h5py.File(
-                #filename,'w',driver='mpio',comm=MPI.COMM_WORLD)
-            self.datastore = h5py.File(filename,'w')
-            logger.debug('creating file "%s"',filename)
-        #gevent.joinall(
-            #gevent.spawn(self.process_loop),
-        #])
-        #self.datastore.atomic = True
         if failed is not None:
             self.process_failed_loop(failed)
         elif reprocess is not None:
             self.process_recompute_loop(reprocess)
         else:
             self.process_loop()
-        self.datastore.close()
 
     def process_log(self,group,d_id,meta,lines):
         self.redis.hsetnx(d_id,'n_runs',0)
@@ -377,50 +355,54 @@ class FoamPostProcessorHDF5(BaseApp):
         cfl_mean = float(self.redis.hget(d_id,'cfl_mean'))
         cfl_max = float(self.redis.hget(d_id,'cfl_max'))
         deltaT =float( self.redis.hget(d_id,'deltaT'))
+        state = self.redis.hget(d_id,'state')
         while len(lines):
             line = lines.pop(0).strip()
             if line.startswith('Time ='):
                 key, value = line.split(' = ')
                 start_time = float(value)
+                state = 'outer'
             if 'Solving for ' in line:
-                n_ortho = 0
-                key,dd,start = proc_line(
-                    line,start_time,n_iter,n_outer_corr,n_corr,n_ortho)
+                key,dd,start = proc_line(line)
                 if not key in d:
                     d[key] = []
-                d[key].append(dd)
-                while len(lines):
-                    if not lines[0].startswith(start):
-                        break
+                if key == state:
                     n_ortho += 1
-                    key,dd,start = proc_line(
-                        lines.pop(0),start_time,n_iter,n_outer_corr,n_corr,n_ortho)
-                    d[key].append(dd)
+                else:
+                    n_ortho = 0
+                d[key].append(dd+(start_time,n_iter,n_outer_corr,n_corr,n_ortho))
+                state = key
             elif line.startswith('Courant Number mean:'):
                 fields = line.split(': ')
                 cfl_mean = float(fields[1].split()[0])
                 cfl_max = float(fields[2])
+                state = 'outer'
             elif line.startswith('deltaT ='):
                 deltaT = float(line.split(' = ')[1])
+                state = 'outer'
             elif line.startswith('time step continuity errors'):
+                state = 'inner'
                 n_corr +=1
                 n_ortho_max = n_ortho
-                n_ortho = 0
                 key, rest = line.split(':')
                 fields = rest.split(',')
                 tsceinfo.append((float(fields[0].split('=')[1].strip()),
                       float(fields[1].split('=')[1].strip()),
                       float(fields[2].split('=')[1].strip()),n_iter,n_outer_corr,n_corr))
             elif line.startswith('PIMPLE: iteration'):
+                state = 'inner'
                 n_corr_max = n_corr
                 n_corr = 0
                 n_outer_corr += 1
             elif line.startswith('PIMPLE: '):
                 convergence_info = line.split(':')[1].strip()
+                state = 'inner'
             elif 'Re-reading object' in line:
                 name,filepath = line[18:].split(' from file ')
                 reread.append((n_iter,name,filepath.strip('"')))
+                state = 'outer'
             elif line.startswith('ExecutionTime'):
+                state = 'outer'
                 fields = line.split('  ')
                 maininfo.append((
                     start_time,
@@ -438,6 +420,7 @@ class FoamPostProcessorHDF5(BaseApp):
                 self.redis.hincrby(d_id,'n_runs')
                 n_iter = 0
                 n_outer_corr = 0
+                state = 'outer'
                 break
 
         # update the generic keys
@@ -479,6 +462,7 @@ class FoamPostProcessorHDF5(BaseApp):
         self.redis.hset(d_id,'cfl_mean',cfl_mean)
         self.redis.hset(d_id,'cfl_max',cfl_max)
         self.redis.hset(d_id,'deltaT',deltaT)
+        self.redis.hset(d_id,'state',state)
 
     def process_system(self,group,d_id,meta,lines):
         pass
@@ -615,8 +599,12 @@ class FoamServer(BaseApp):
                 if self.sock.poll(self.TIMEOUT,flags=zmq.POLLIN):
                     msg = self.sock.recv_multipart()
                     if msg[2] == 'data!':
-                        doc_id,msg_hash = self.handle_data(msg[3],msg[4])
-                        self.sock.send_multipart([msg[0],'','confirm!',doc_id,msg_hash])
+                        try:
+                            doc_id,msg_hash = self.handle_data(msg[3],msg[4])
+                        except redis.exceptions.ResponseError as e:
+                            logger.error('redis connection error "%s"',e)
+                        else:
+                            self.sock.send_multipart([msg[0],'','confirm!',doc_id,msg_hash])
                     elif msg[2] == 'alive?':
                         if (time.time()-float(msg[3])) < 1:
                             self.sock.send_multipart([msg[0],'','alive!',str(time.time())])

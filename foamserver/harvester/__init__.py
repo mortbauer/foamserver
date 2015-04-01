@@ -9,6 +9,7 @@ import uuid
 import json
 import yaml
 import time
+import gipc
 import copy
 import click
 import signal
@@ -401,14 +402,20 @@ class Harvester(object):
                 elif msg[1] == 'alive!':
                     lastlive = time.time()
                     if (float(msg[2])-sent) > 1:
-                        self.sock.send_multipart(['','data!',key_msg,payload_msg])
+                        try:
+                            self.sock.send_multipart(['','data!',key_msg,payload_msg])
+                        except zmq.Again as e:
+                            logger.error('send_multipart failed "%s"',e)
                         sent = time.time()
                         print('resending %s'%key_msg)
                 else:
                     print('unknown command "%s"'%msg[1])
             else:
                 if (time.time() - lastlive) > (self.timeout):
-                    self.sock.send_multipart(['','alive?',str(time.time())],flags=zmq.NOBLOCK)
+                    try:
+                        self.sock.send_multipart(['','alive?',str(time.time())],flags=zmq.NOBLOCK)
+                    except zmq.Again as e:
+                        logger.error('send_multipart failed "%s"',e)
                     self.timeout += 1
 
     def send_loop(self):
@@ -499,10 +506,11 @@ class Harvester(object):
             self.default_signal_handler = signal.signal(
                 signal.SIGINT, self.loop_interrupt_handler)
             # now block until finnished
-            gevent.joinall([
+            loops = [
                 gevent.spawn(self.process_loop),
                 gevent.spawn(self.send_loop),
-            ])
+            ]
+            gevent.joinall(loops)
             # save the state,
             signal.signal(signal.SIGINT, self.save_interrupt_handler)
             self.save_state()
