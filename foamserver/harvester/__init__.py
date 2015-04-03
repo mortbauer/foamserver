@@ -88,7 +88,7 @@ class EventHandler(RegexMatchingEventHandler):
                         if any(r.match(p) for r in self.regexes) and not \
                                 any(r.match(p) for r in self.ignore_regexes):
                             if os.stat(fullpath).st_mtime < last_run_time:
-                                logger.info('skipping file "%s" old mtime',fullpath)
+                                logger.info('skipping due old mtime "%s"',fullpath)
                             else:
                                 self.enqueue(fullpath)
         else:
@@ -97,7 +97,7 @@ class EventHandler(RegexMatchingEventHandler):
                 if any(r.match(p) for r in self.regexes) and not \
                         any(r.match(p) for r in self.ignore_regexes):
                     if os.stat(fullpath).st_mtime < last_run_time:
-                        logger.info('skipping file "%s" old mtime',fullpath)
+                        logger.info('skipping due old mtime "%s"',fullpath)
                     else:
                         self.enqueue(fullpath)
 
