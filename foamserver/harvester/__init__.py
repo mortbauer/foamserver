@@ -69,16 +69,16 @@ def encode_datetime(obj):
 
 
 class EventHandler(RegexMatchingEventHandler):
-    def __init__(self,redis,queuename,proctype,regexes=None,ignore_regexes=None,root_regexes=None):
+    def __init__(self,redis,queue,proctype,regexes=None,ignore_regexes=None,root_regexes=None):
         super(EventHandler,self).__init__(
             regexes=regexes,ignore_regexes=ignore_regexes,ignore_directories=True)
         self.redis = redis
-        self.queuename = queuename
+        self.queue = queue
         self.root_regexes = [] if root_regexes is None else [re.compile(x) for x in root_regexes]
         self.type = proctype
 
     def enqueue(self,path):
-        self.redis.rpush(self.queuename,dumps((self.type,path)))
+        self.queue.put(dumps((self.type,path)))
 
     def init(self,path,recursive,last_run_time):
         if recursive:
