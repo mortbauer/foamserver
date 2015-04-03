@@ -79,19 +79,27 @@ class EventHandler(RegexMatchingEventHandler):
     def enqueue(self,path):
         self.redis.rpush(self.queuename,dumps((self.type,path)))
 
-    def init(self,path,recursive):
+    def init(self,path,recursive,last_run_time):
         if recursive:
             for root, dirs, files in os.walk(path):
                 if any(r.match(root) for r in self.root_regexes):
                     for p in files:
+                        fullpath = os.path.join(root,p)
                         if any(r.match(p) for r in self.regexes) and not \
                                 any(r.match(p) for r in self.ignore_regexes):
-                            self.enqueue(os.path.join(root,p))
+                            if os.stat(fullpath).st_mtime < last_run_time:
+                                logger.info('skipping file "%s" old mtime',fullpath)
+                            else:
+                                self.enqueue(fullpath)
         else:
             for p in os.listdir(path):
+                fullpath = os.path.join(path,p)
                 if any(r.match(p) for r in self.regexes) and not \
                         any(r.match(p) for r in self.ignore_regexes):
-                    self.enqueue(os.path.join(path,p))
+                    if os.stat(fullpath).st_mtime < last_run_time:
+                        logger.info('skipping file "%s" old mtime',fullpath)
+                    else:
+                        self.enqueue(fullpath)
 
     def on_modified(self,event):
         logger.debug('eventhandler got change for %s',event.src_path)
@@ -344,6 +352,7 @@ class Harvester(object):
         except:
             logger.error('failed to load {0}'.format(self.PERSISTENCE))
         self.state = self.data['state']
+        self.last_run_time = self.data.get('save_time',0)
         self.uuid = self.data['uuid']
         #self.meta['harvester_starttime'] = self.data['harvester_starttime']
         self.meta['uuid'] = self.uuid
@@ -352,6 +361,7 @@ class Harvester(object):
         self.meta['harvester_version'] = VERSION
 
     def save_state(self):
+        self.data['save_time'] = time.time()
         try:
             if os.path.isfile(self.PERSISTENCE):
                 os.chmod(self.PERSISTENCE,stat.S_IWRITE|stat.S_IRGRP|stat.S_IROTH)
@@ -380,7 +390,7 @@ class Harvester(object):
                 ignore_regexes=item.get('ignore_regexes',processor.IGNORE_REGEXES),
             )
             # fire my initialitation
-            handler.init(item['path'],recursive)
+            handler.init(item['path'],recursive,self.last_run_time)
             logger.debug('sheduled observer for path %s %s %s',item['path'],recursive,item.get('regexes',processor.REGEXES))
             self.observer.schedule(handler,item['path'],recursive=recursive)
 
