@@ -10,6 +10,7 @@ import json
 import yaml
 import time
 import copy
+import Queue
 import click
 import signal
 import socket
@@ -297,10 +298,11 @@ class Harvester(object):
         self.load_conf()
         self.load_state()
         self.connect()
-        self._pqueue = self.make_redis_name('processing')
+        self._pqueue = Queue.Queue()
+        #self._pqueue = self.make_redis_name('processing')
         self._squeue = self.make_redis_name('sending')
         self._store = self.make_redis_name('payloadstore')
-        self.pqueu_len = lambda : self.redis.llen(self._pqueue)
+        #self.pqueu_len = lambda : self.redis.llen(self._pqueue)
         self.squeu_len = lambda : self.redis.llen(self._squeue)
         self.observer = watchdog.observers.Observer()
         self.processors = {x.TYPE:x(self.state) for x in self.PROCESSORS}
@@ -451,8 +453,8 @@ class Harvester(object):
     def process_loop(self,*args):
         logger.debug('process_loop ready')
         while not self._stop:
-            task = self.redis.lpop(self._pqueue)
-            if task:
+            if not self._pqueue.empty():
+                task = self._pqueue.get_nowait()#self.redis.lpop(self._pqueue)
                 _type, path = loads(task)
                 if os.path.isdir(path):
                     continue
