@@ -88,19 +88,13 @@ class EventHandler(RegexMatchingEventHandler):
                         fullpath = os.path.join(root,p)
                         if any(r.match(p) for r in self.regexes) and not \
                                 any(r.match(p) for r in self.ignore_regexes):
-                            if os.stat(fullpath).st_mtime < last_run_time:
-                                logger.info('skipping due old mtime "%s"',fullpath)
-                            else:
-                                self.enqueue(fullpath)
+                            self.enqueue(fullpath)
         else:
             for p in os.listdir(path):
                 fullpath = os.path.join(path,p)
                 if any(r.match(p) for r in self.regexes) and not \
                         any(r.match(p) for r in self.ignore_regexes):
-                    if os.stat(fullpath).st_mtime < last_run_time:
-                        logger.info('skipping due old mtime "%s"',fullpath)
-                    else:
-                        self.enqueue(fullpath)
+                    self.enqueue(fullpath)
 
     def on_modified(self,event):
         logger.debug('eventhandler got change for %s',event.src_path)
