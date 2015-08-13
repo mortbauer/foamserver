@@ -32,8 +32,11 @@ VERSION = 0.3
 
 CONFIG_SCHEMA = {
     'project': {'type': 'string','required':True},
-    'redis_password': {'type': 'string','required':False},
     'redis_host': {'type': 'string','required':False},
+    'redis_port': {'type': 'string','required':False},
+    'redis_password': {'type': 'string','required':False},
+    'server_host': {'type': 'string','required':False},
+    'server_post': {'type': 'string','required':False},
     'watch':{'type':'list','required':True,'schema':{
         'type':'dict','schema':{
             'type':{
@@ -309,8 +312,8 @@ class Harvester(object):
         self.sock = self.context.socket(zmq.DEALER)
         self.sock.set_hwm(self.HWM)
         self.sock.connect('tcp://{0}:{1}'.format(
-            self.conf.get('host','localhost'),
-            self.conf.get('port',self.SERVER_PORT)))
+            self.conf.get('server_host','localhost'),
+            self.conf.get('server_port',self.SERVER_PORT)))
 
     def terminate_connection(self):
         self.sock.close(linger=0)
