@@ -165,14 +165,14 @@ class FoamPostProcessorHDF5(BaseApp):
 
     tsce_row = [
         ('sum local','f8'),('global','f8'),('cumulative','f8'),
-        ('n_iter','i8'),('n_outer_corr','i8'),('n_corr','i8')]
+        ('time','f8'),('n_iter','i8'),('n_outer_corr','i8'),('n_corr','i8')]
 
     main_row = [
         ('time','f8'),('execution_time','f8'),('clock_time','f8'),
         ('convergence','S40'),('delta_t','f8'),('cfl_mean','f8'),
         ('cfl_max','f8'),('n_iter','i8'),('n_outer_corr','i8'),('n_corr','i8'),('n_ortho','i8')]
 
-    reread_row = [('n_iter','i8'),('name','S20'),('path','S150')]
+    reread_row = [('time','f8'),('n_iter','i8'),('name','S20'),('path','S150')]
 
     def __init__(self,**kwargs):
         super(FoamPostProcessorHDF5,self).__init__(**kwargs)
@@ -388,7 +388,7 @@ class FoamPostProcessorHDF5(BaseApp):
                 fields = rest.split(',')
                 tsceinfo.append((float(fields[0].split('=')[1].strip()),
                       float(fields[1].split('=')[1].strip()),
-                      float(fields[2].split('=')[1].strip()),n_iter,n_outer_corr,n_corr))
+                      float(fields[2].split('=')[1].strip()),start_time,n_iter,n_outer_corr,n_corr))
             elif line.startswith('PIMPLE: iteration'):
                 state = 'inner'
                 n_corr_max = n_corr
@@ -399,7 +399,7 @@ class FoamPostProcessorHDF5(BaseApp):
                 state = 'inner'
             elif 'Re-reading object' in line:
                 name,filepath = line[18:].split(' from file ')
-                reread.append((n_iter,name,filepath.strip('"')))
+                reread.append((start_time,n_iter,name,filepath.strip('"')))
                 state = 'outer'
             elif line.startswith('ExecutionTime'):
                 state = 'outer'
